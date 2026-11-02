@@ -1,0 +1,56 @@
+# Quick Look for Linux (Rust)
+
+A fast, lightweight, macOS-inspired Quick Look preview application written in Rust.
+
+## Reverse-Engineered macOS Preview / Quick Look Architecture
+
+macOS Quick Look achieves its instant, zero-lag feel through four core design decisions:
+
+1. **Read-Only Streaming Pipeline**: It avoids loading full editable document models. Large files are read in small chunks or memory-mapped so startup latency remains strictly sub-16ms.
+2. **GPU Texture Blitting**: Rendering is delegated directly to hardware acceleration (OpenGL / Metal / Vulkan), maintaining 60/120 FPS during panning and zooming.
+3. **Sibling Discovery**: Previewing a file automatically enumerates adjacent items in the folder, letting you press `Left` / `Right` or `Up` / `Down` to flick through files without window recreation or flicker.
+4. **Universal Fallback**: It never throws an unhandled format error. Unrecognized files gracefully degrade to a formatted 3-column Hex Viewer (Offset, Hex Bytes, ASCII) and metadata inspector.
+
+## Supported Formats
+
+| Category | Formats | Viewer Capabilities |
+| :--- | :--- | :--- |
+| **Images** | PNG, JPG, JPEG, GIF, WEBP, BMP, SVG, ICO, TIFF | GPU-rendered, auto-fit, drag-to-pan, scroll-wheel zoom, dimensions (`W × H px`) |
+| **Code & Text** | `.rs`, `.py`, `.js`, `.ts`, `.c`, `.cpp`, `.go`, `.java`, `.sh`, `.json`, `.toml`, `.yaml`, `.html`, `.css`, etc. | Syntax-highlighted (Syntect), line numbers, monospace font, 512KB streaming limit to prevent UI lockup |
+| **Markdown** | `.md`, `.markdown` | Formatted headers, blockquotes, code blocks, bullet points |
+| **Directories** | Any directory / folder | File count, folder contents table with file icons, sizes, and relative modification timestamps |
+| **Archives** | `.zip`, `.jar`, `.war` | Direct header inspection listing archive contents without extracting |
+| **PDF** | `.pdf` | Page estimate count, document metadata, one-click open |
+| **Media** | Audio (`mp3`, `wav`, `flac`, `ogg`) & Video (`mp4`, `mkv`, `webm`, `mov`) | Media badge, file size, format details, external launcher |
+| **Binary Fallback** | Any unknown binary (`.bin`, `.so`, `.dat`, executables) | 3-column macOS Quick Look-style Hex Viewer (`Offset`, `Hex`, `ASCII`) |
+
+## Keyboard & Mouse Shortcuts
+
+- `Space` / `Esc` / `q` : Close window immediately
+- `◀` / `Left Arrow` / `Up Arrow` / `k` : Previous file in folder
+- `▶` / `Right Arrow` / `Down Arrow` / `j` : Next file in folder
+- `+` / `-` / `0` : Zoom in, zoom out, reset zoom (100%)
+- `Enter` / `o` : Open file in default desktop application (`xdg-open`)
+- `Mouse Drag` : Pan image
+- `Scroll Wheel` : Zoom image or scroll document
+
+## Building & Installation
+
+### Requirements
+- Rust & Cargo (`rustc >= 1.75`)
+
+### Install
+```bash
+./install.sh
+```
+Or manually:
+```bash
+cargo build --release
+cp target/release/quicklook ~/.local/bin/
+```
+
+### Linux File Manager Integration
+
+- **GNOME (Nautilus)**: Installed to `~/.local/share/nautilus/scripts/Quick Look` (Right-click any file -> Scripts -> Quick Look).
+- **Custom Shortcut / Spacebar Trigger**: Under GNOME Settings -> Keyboard -> Custom Shortcuts, bind `quicklook "$PWD"` or a script tracking selected files.
+

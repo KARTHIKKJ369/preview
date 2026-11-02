@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Quick Look
+Comment=Fast, lightweight macOS-style file previewer
+Exec=quicklook %U
+Icon=system-search
+Terminal=false
+Categories=Utility;Viewer;
+MimeType=all/allfiles;
+
