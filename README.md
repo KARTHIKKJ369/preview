@@ -54,6 +54,17 @@ cp target/release/quicklook ~/.local/bin/
 
 ### Linux File Manager Integration
 
-- **GNOME (Nautilus)**: Installed to `~/.local/share/nautilus/scripts/Quick Look` (Right-click any file -> Scripts -> Quick Look).
-- **Custom Shortcut / Spacebar Trigger**: Under GNOME Settings -> Keyboard -> Custom Shortcuts, bind `quicklook "$PWD"` or a script tracking selected files.
+#### KDE Dolphin (Recommended macOS Experience)
+1. Run `./install.sh`. It automatically installs the Dolphin Service Menu to `~/.local/share/kio/servicemenus/quicklook.desktop`.
+2. In Dolphin, open **Settings → Configure Shortcuts** (or `Ctrl+Shift+,`).
+3. Search for **Quick Look** in the list.
+4. Set its shortcut to **Space**!
+5. Now, selecting any file in Dolphin and pressing **Space** opens Quick Look instantly.
+
+#### GNOME Nautilus
+- Installed to `~/.local/share/nautilus/scripts/Quick Look` (Right-click any file -> Scripts -> Quick Look).
+- Or bind a custom shortcut (e.g. `Super+Space`) to `quicklook`.
+
+#### Automatic Dolphin Selection Detection
+If `quicklook` is invoked from a global hotkey or terminal without arguments while Dolphin is focused, it automatically queries Dolphin's active selection over D-Bus (`org.kde.dolphin`) and previews the selected file without opening the directory.
 

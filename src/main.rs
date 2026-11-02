@@ -28,9 +28,9 @@ fn main() -> eframe::Result<()> {
     }
 
     let initial_path = if args.len() > 1 && !args[1].starts_with('-') {
-        PathBuf::from(&args[1])
+        Some(parse_input_path(&args[1]))
     } else {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        detect_active_selection()
     };
 
     let options = eframe::NativeOptions {
@@ -69,6 +69,7 @@ fn configure_mac_style(ctx: &egui::Context) {
 
 #[derive(Debug)]
 pub enum FileKind {
+    Welcome,
     Image {
         width: u32,
         height: u32,
@@ -139,7 +140,7 @@ pub struct DirItem {
 }
 
 pub struct QuickLookApp {
-    current_path: PathBuf,
+    current_path: Option<PathBuf>,
     siblings: Vec<PathBuf>,
     sibling_idx: usize,
     file_size: u64,
@@ -150,24 +151,33 @@ pub struct QuickLookApp {
 }
 
 impl QuickLookApp {
-    pub fn new(target: PathBuf) -> Self {
-        let abs_path = fs::canonicalize(&target).unwrap_or(target);
-        let siblings = get_siblings(&abs_path);
-        let sibling_idx = siblings.iter().position(|p| p == &abs_path).unwrap_or(0);
-
+    pub fn new(target: Option<PathBuf>) -> Self {
         let mut app = Self {
-            current_path: abs_path,
-            siblings,
-            sibling_idx,
+            current_path: None,
+            siblings: Vec::new(),
+            sibling_idx: 0,
             file_size: 0,
-            file_kind: FileKind::Error("Initializing...".into()),
+            file_kind: FileKind::Welcome,
             zoom_scale: 1.0,
             pan_offset: egui::Vec2::ZERO,
             search_filter: String::new(),
         };
 
-        app.load_current_file();
+        if let Some(t) = target {
+            app.set_target(t);
+        }
         app
+    }
+
+    fn set_target(&mut self, target: PathBuf) {
+        let abs_path = fs::canonicalize(&target).unwrap_or(target);
+        self.siblings = get_siblings(&abs_path);
+        self.sibling_idx = self.siblings.iter().position(|p| p == &abs_path).unwrap_or(0);
+        self.current_path = Some(abs_path);
+        self.zoom_scale = 1.0;
+        self.pan_offset = egui::Vec2::ZERO;
+        self.search_filter.clear();
+        self.load_current_file();
     }
 
     fn navigate(&mut self, delta: isize) {
@@ -177,7 +187,7 @@ impl QuickLookApp {
         let len = self.siblings.len() as isize;
         let new_idx = ((self.sibling_idx as isize + delta).rem_euclid(len)) as usize;
         self.sibling_idx = new_idx;
-        self.current_path = self.siblings[new_idx].clone();
+        self.current_path = Some(self.siblings[new_idx].clone());
         self.zoom_scale = 1.0;
         self.pan_offset = egui::Vec2::ZERO;
         self.search_filter.clear();
@@ -185,7 +195,14 @@ impl QuickLookApp {
     }
 
     fn load_current_file(&mut self) {
-        let path = &self.current_path;
+        let path = match self.current_path.as_deref() {
+            Some(p) => p,
+            None => {
+                self.file_kind = FileKind::Welcome;
+                return;
+            }
+        };
+
         let metadata = match fs::metadata(path) {
             Ok(m) => m,
             Err(e) => {
@@ -392,7 +409,9 @@ impl eframe::App for QuickLookApp {
                 }
             }
             if i.key_pressed(egui::Key::O) || i.key_pressed(egui::Key::Enter) {
-                let _ = open::that(&self.current_path);
+                if let Some(ref path) = self.current_path {
+                    let _ = open::that(path);
+                }
             }
         });
 
@@ -426,29 +445,38 @@ impl eframe::App for QuickLookApp {
                     ui.separator();
 
                     // File Name & Details
-                    let file_name = self
-                        .current_path
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("Unknown");
+                    if let Some(ref current_path) = self.current_path {
+                        let file_name = current_path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("Unknown");
 
-                    ui.label(
-                        egui::RichText::new(file_name)
-                            .strong()
-                            .size(15.0)
-                            .color(egui::Color32::WHITE),
-                    );
+                        ui.label(
+                            egui::RichText::new(file_name)
+                                .strong()
+                                .size(15.0)
+                                .color(egui::Color32::WHITE),
+                        );
 
-                    // Badge: File Size
-                    let size_str = format_bytes(self.file_size);
-                    ui.label(
-                        egui::RichText::new(format!("·  {size_str}"))
-                            .color(egui::Color32::from_rgb(160, 160, 165))
-                            .size(12.0),
-                    );
+                        // Badge: File Size
+                        let size_str = format_bytes(self.file_size);
+                        ui.label(
+                            egui::RichText::new(format!("·  {size_str}"))
+                                .color(egui::Color32::from_rgb(160, 160, 165))
+                                .size(12.0),
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new("Quick Look")
+                                .strong()
+                                .size(15.0)
+                                .color(egui::Color32::WHITE),
+                        );
+                    }
 
                     // Badge: Type Details
                     let detail_str = match &self.file_kind {
+                        FileKind::Welcome => "".into(),
                         FileKind::Image { width, height, .. } => {
                             if *width > 0 && *height > 0 {
                                 format!("·  {width} × {height} px")
@@ -492,24 +520,32 @@ impl eframe::App for QuickLookApp {
                         FileKind::Error(_) => "·  Error".into(),
                     };
 
-                    ui.label(
-                        egui::RichText::new(detail_str)
-                            .color(egui::Color32::from_rgb(142, 142, 147))
-                            .size(12.0),
-                    );
+                    if !detail_str.is_empty() {
+                        ui.label(
+                            egui::RichText::new(detail_str)
+                                .color(egui::Color32::from_rgb(142, 142, 147))
+                                .size(12.0),
+                        );
+                    }
 
                     // Right Aligned Controls
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // Open with default app button
-                        if ui
-                            .button(
-                                egui::RichText::new("↗ Open with App")
-                                    .color(egui::Color32::from_rgb(220, 220, 255)),
-                            )
-                            .on_hover_text("Open in default Linux system application (Enter / o)")
-                            .clicked()
-                        {
-                            let _ = open::that(&self.current_path);
+                        if let Some(ref path) = self.current_path {
+                            if ui
+                                .button(
+                                    egui::RichText::new("↗ Open with App")
+                                        .color(egui::Color32::from_rgb(220, 220, 255)),
+                                )
+                                .on_hover_text("Open in default Linux system application (Enter / o)")
+                                .clicked()
+                            {
+                                let _ = open::that(path);
+                            }
+                        } else if ui.button("📂 Choose File...").clicked() {
+                            if let Some(p) = prompt_file_dialog() {
+                                self.set_target(p);
+                            }
                         }
 
                         // Image zoom controls
@@ -530,7 +566,13 @@ impl eframe::App for QuickLookApp {
             });
 
         // 2. Main Content Canvas
+        let mut target_to_set = None;
         egui::CentralPanel::default().show(ctx, |ui| match &mut self.file_kind {
+            FileKind::Welcome => {
+                if let Some(p) = render_welcome_viewer(ui) {
+                    target_to_set = Some(p);
+                }
+            }
             FileKind::Image { uri, .. } => {
                 render_image_viewer(ui, uri, &mut self.zoom_scale, &mut self.pan_offset);
             }
@@ -556,10 +598,12 @@ impl eframe::App for QuickLookApp {
                 render_archive_viewer(ui, entries, &mut self.search_filter);
             }
             FileKind::Pdf { page_estimate } => {
-                render_pdf_viewer(ui, &self.current_path, *page_estimate);
+                let p = self.current_path.as_deref().unwrap_or(Path::new("document.pdf"));
+                render_pdf_viewer(ui, p, *page_estimate);
             }
             FileKind::Media { kind } => {
-                render_media_viewer(ui, &self.current_path, kind, self.file_size);
+                let p = self.current_path.as_deref().unwrap_or(Path::new("media"));
+                render_media_viewer(ui, p, kind, self.file_size);
             }
             FileKind::Hex { data, total_size } => {
                 render_hex_viewer(ui, data, *total_size);
@@ -574,12 +618,73 @@ impl eframe::App for QuickLookApp {
                 });
             }
         });
+
+        if let Some(target) = target_to_set {
+            self.set_target(target);
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
 // VIEWERS FOR EACH FORMAT
 // ---------------------------------------------------------------------------
+
+fn render_welcome_viewer(ui: &mut egui::Ui) -> Option<PathBuf> {
+    let mut selected = None;
+    ui.centered_and_justified(|ui| {
+        ui.vertical_centered(|ui| {
+            ui.add_space(24.0);
+            ui.label(egui::RichText::new("🔍").size(64.0));
+            ui.add_space(12.0);
+            ui.heading(
+                egui::RichText::new("Quick Look")
+                    .size(24.0)
+                    .strong()
+                    .color(egui::Color32::WHITE),
+            );
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new("Select any file in Dolphin and press Space to preview instantly.")
+                    .size(15.0)
+                    .color(egui::Color32::from_rgb(170, 170, 180)),
+            );
+            ui.add_space(18.0);
+
+            if ui
+                .button(
+                    egui::RichText::new("📂  Choose File to Preview...")
+                        .size(14.0)
+                        .color(egui::Color32::WHITE),
+                )
+                .clicked()
+            {
+                if let Some(path) = prompt_file_dialog() {
+                    selected = Some(path);
+                }
+            }
+
+            ui.add_space(28.0);
+            egui::Frame::canvas(ui.style())
+                .fill(egui::Color32::from_rgb(32, 34, 40))
+                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(60, 62, 70)))
+                .rounding(egui::Rounding::same(8.0))
+                .inner_margin(egui::Margin::symmetric(24.0, 16.0))
+                .show(ui, |ui| {
+                    ui.set_max_width(520.0);
+                    ui.label(
+                        egui::RichText::new("💡 Dolphin / KDE Spacebar Setup:")
+                            .strong()
+                            .color(egui::Color32::from_rgb(0, 122, 255)),
+                    );
+                    ui.add_space(4.0);
+                    ui.label("1. Open Dolphin → Settings → Configure Shortcuts");
+                    ui.label("2. Search for 'Quick Look'");
+                    ui.label("3. Assign shortcut to Space key");
+                });
+        });
+    });
+    selected
+}
 
 fn render_image_viewer(
     ui: &mut egui::Ui,
@@ -1656,6 +1761,122 @@ fn decode_xml_entities(s: &str) -> String {
         .replace("&apos;", "'")
 }
 
+fn prompt_file_dialog() -> Option<PathBuf> {
+    // 1. Try kdialog (KDE Plasma)
+    if let Ok(output) = std::process::Command::new("kdialog")
+        .arg("--getopenfilename")
+        .output()
+    {
+        if output.status.success() {
+            let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !s.is_empty() {
+                return Some(parse_input_path(&s));
+            }
+        }
+    }
+    // 2. Try zenity (GNOME / GTK)
+    if let Ok(output) = std::process::Command::new("zenity")
+        .arg("--file-selection")
+        .output()
+    {
+        if output.status.success() {
+            let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !s.is_empty() {
+                return Some(parse_input_path(&s));
+            }
+        }
+    }
+    None
+}
+
+fn parse_input_path(raw: &str) -> PathBuf {
+    let raw_trimmed = raw.trim();
+    let path_str = if let Some(stripped) = raw_trimmed.strip_prefix("file://") {
+        decode_url_percent(stripped)
+    } else {
+        raw_trimmed.to_string()
+    };
+    PathBuf::from(path_str)
+}
+
+fn decode_url_percent(s: &str) -> String {
+    let mut result = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                result.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        result.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&result).to_string()
+}
+
+fn detect_active_selection() -> Option<PathBuf> {
+    // 1. Query KDE Dolphin over D-Bus (supports qdbus6, qdbus, qdbus-qt5, and busctl)
+    let kde_query = r#"
+        for cmd in qdbus6 qdbus qdbus-qt5; do
+            if command -v "$cmd" >/dev/null 2>&1; then
+                svc=$("$cmd" 2>/dev/null | grep -m1 org.kde.dolphin)
+                if [ -n "$svc" ]; then
+                    url=$("$cmd" "$svc" /dolphin/Dolphin_1 org.kde.dolphin.MainWindow.selectedUrls 2>/dev/null | head -n1)
+                    if [ -n "$url" ]; then echo "$url"; exit 0; fi
+                fi
+            fi
+        done
+        if command -v busctl >/dev/null 2>&1; then
+            svc=$(busctl --user list 2>/dev/null | grep -m1 org.kde.dolphin | awk '{print $1}')
+            if [ -n "$svc" ]; then
+                url=$(busctl --user call "$svc" /dolphin/Dolphin_1 org.kde.dolphin.MainWindow selectedUrls 2>/dev/null | grep -o 'file://[^"]*' | head -n1)
+                if [ -n "$url" ]; then echo "$url"; exit 0; fi
+            fi
+        fi
+    "#;
+
+    if let Ok(output) = std::process::Command::new("sh").arg("-c").arg(kde_query).output() {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !text.is_empty() {
+                let p = parse_input_path(&text);
+                if p.exists() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+
+    // 2. Query universal Wayland / X11 primary selection or clipboard
+    let clip_query = r#"
+        wl-paste --primary 2>/dev/null || \
+        wl-paste 2>/dev/null || \
+        xclip -o -selection primary 2>/dev/null || \
+        xclip -o -selection clipboard 2>/dev/null || \
+        xsel -o -p 2>/dev/null || \
+        xsel -o -b 2>/dev/null
+    "#;
+
+    if let Ok(output) = std::process::Command::new("sh").arg("-c").arg(clip_query).output() {
+        if output.status.success() {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    let p = parse_input_path(trimmed);
+                    if p.exists() {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1704,5 +1925,14 @@ mod tests {
         } else {
             panic!("Expected spreadsheet");
         }
+    }
+
+    #[test]
+    fn test_parse_input_path() {
+        let path1 = parse_input_path("file:///home/karthik/My%20Documents/test.txt");
+        assert_eq!(path1, PathBuf::from("/home/karthik/My Documents/test.txt"));
+
+        let path2 = parse_input_path("/home/karthik/plain_path.png");
+        assert_eq!(path2, PathBuf::from("/home/karthik/plain_path.png"));
     }
 }
