@@ -84,6 +84,19 @@ pub enum FileKind {
         content: String,
         lines: usize,
     },
+    Spreadsheet {
+        rows: Vec<Vec<String>>,
+        total_rows: usize,
+        total_cols: usize,
+    },
+    Presentation {
+        slides: Vec<SlideInfo>,
+        current_slide: usize,
+    },
+    Document {
+        paragraphs: Vec<DocParagraph>,
+        word_count: usize,
+    },
     Directory {
         entries: Vec<DirItem>,
         total_items: usize,
@@ -103,6 +116,18 @@ pub enum FileKind {
         total_size: u64,
     },
     Error(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct SlideInfo {
+    pub title: String,
+    pub bullets: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DocParagraph {
+    pub text: String,
+    pub is_heading: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -198,13 +223,55 @@ impl QuickLookApp {
             _ => {}
         }
 
-        // 2. Archives (ZIP detection)
+        // 2. Presentations (PowerPoint PPTX, ODP, PPT)
+        if ext == "pptx" || ext == "odp" {
+            self.file_kind = load_pptx(path);
+            return;
+        }
+        if ext == "ppt" {
+            self.file_kind = load_legacy_office(path, "PowerPoint Presentation");
+            return;
+        }
+
+        // 3. Spreadsheets (Excel XLSX, ODS, XLS, CSV, TSV)
+        if ext == "xlsx" || ext == "ods" {
+            self.file_kind = load_xlsx(path);
+            return;
+        }
+        if ext == "xls" {
+            self.file_kind = load_legacy_office(path, "Excel Spreadsheet");
+            return;
+        }
+        if ext == "csv" {
+            if let Ok(content) = fs::read_to_string(path) {
+                self.file_kind = load_csv_or_tsv(&content, ',');
+                return;
+            }
+        }
+        if ext == "tsv" {
+            if let Ok(content) = fs::read_to_string(path) {
+                self.file_kind = load_csv_or_tsv(&content, '\t');
+                return;
+            }
+        }
+
+        // 4. Word Documents (DOCX, ODT, DOC, RTF)
+        if ext == "docx" || ext == "odt" {
+            self.file_kind = load_docx(path);
+            return;
+        }
+        if ext == "doc" || ext == "rtf" {
+            self.file_kind = load_legacy_office(path, "Word Document");
+            return;
+        }
+
+        // 5. Archives (ZIP detection)
         if ext == "zip" || ext == "jar" || ext == "war" {
             self.file_kind = load_zip_listing(path, self.file_size);
             return;
         }
 
-        // 3. Audio & Video
+        // 6. Audio & Video
         match ext.as_str() {
             "mp3" | "wav" | "ogg" | "flac" | "aac" | "m4a" | "opus" => {
                 self.file_kind = FileKind::Media { kind: "Audio" };
@@ -217,7 +284,7 @@ impl QuickLookApp {
             _ => {}
         }
 
-        // 4. PDF
+        // 7. PDF
         if ext == "pdf" {
             let pages = estimate_pdf_pages(path);
             self.file_kind = FileKind::Pdf {
@@ -310,6 +377,20 @@ impl eframe::App for QuickLookApp {
                 self.zoom_scale = 1.0;
                 self.pan_offset = egui::Vec2::ZERO;
             }
+            if i.key_pressed(egui::Key::PageDown) {
+                if let FileKind::Presentation { current_slide, slides } = &mut self.file_kind {
+                    if *current_slide + 1 < slides.len() {
+                        *current_slide += 1;
+                    }
+                }
+            }
+            if i.key_pressed(egui::Key::PageUp) {
+                if let FileKind::Presentation { current_slide, .. } = &mut self.file_kind {
+                    if *current_slide > 0 {
+                        *current_slide -= 1;
+                    }
+                }
+            }
             if i.key_pressed(egui::Key::O) || i.key_pressed(egui::Key::Enter) {
                 let _ = open::that(&self.current_path);
             }
@@ -382,6 +463,15 @@ impl eframe::App for QuickLookApp {
                         FileKind::Markdown { lines, .. } => {
                             format!("·  MARKDOWN · {lines} lines")
                         }
+                        FileKind::Spreadsheet { total_rows, total_cols, .. } => {
+                            format!("·  Spreadsheet · {total_rows} rows × {total_cols} cols")
+                        }
+                        FileKind::Presentation { slides, current_slide } => {
+                            format!("·  Presentation · Slide {}/{}", current_slide + 1, slides.len())
+                        }
+                        FileKind::Document { word_count, paragraphs } => {
+                            format!("·  Document · ~{word_count} words · {} paragraphs", paragraphs.len())
+                        }
                         FileKind::Directory { total_items, .. } => {
                             format!("·  {total_items} items")
                         }
@@ -440,7 +530,7 @@ impl eframe::App for QuickLookApp {
             });
 
         // 2. Main Content Canvas
-        egui::CentralPanel::default().show(ctx, |ui| match &self.file_kind {
+        egui::CentralPanel::default().show(ctx, |ui| match &mut self.file_kind {
             FileKind::Image { uri, .. } => {
                 render_image_viewer(ui, uri, &mut self.zoom_scale, &mut self.pan_offset);
             }
@@ -449,6 +539,15 @@ impl eframe::App for QuickLookApp {
             }
             FileKind::Markdown { content, .. } => {
                 render_markdown_viewer(ui, content);
+            }
+            FileKind::Spreadsheet { rows, total_rows, total_cols } => {
+                render_spreadsheet_viewer(ui, rows, *total_rows, *total_cols, &mut self.search_filter);
+            }
+            FileKind::Presentation { slides, current_slide } => {
+                render_presentation_viewer(ui, slides, current_slide);
+            }
+            FileKind::Document { paragraphs, word_count } => {
+                render_document_viewer(ui, paragraphs, *word_count);
             }
             FileKind::Directory { entries, .. } => {
                 render_directory_viewer(ui, entries, &mut self.search_filter);
@@ -600,6 +699,194 @@ fn render_markdown_viewer(ui: &mut egui::Ui, content: &str) {
                 }
             }
         });
+}
+
+fn render_spreadsheet_viewer(
+    ui: &mut egui::Ui,
+    rows: &[Vec<String>],
+    total_rows: usize,
+    total_cols: usize,
+    search_filter: &mut String,
+) {
+    ui.horizontal(|ui| {
+        ui.label("🔍 Filter:");
+        ui.text_edit_singleline(search_filter);
+        ui.label(
+            egui::RichText::new(format!("{total_rows} rows × {total_cols} columns"))
+                .color(egui::Color32::from_rgb(142, 142, 147))
+                .size(12.0),
+        );
+    });
+    ui.separator();
+
+    egui::ScrollArea::both()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            egui::Grid::new("spreadsheet_grid")
+                .striped(true)
+                .min_col_width(70.0)
+                .spacing([12.0, 6.0])
+                .show(ui, |ui| {
+                    // Column Headers (A, B, C...)
+                    ui.label(egui::RichText::new("#").color(egui::Color32::from_rgb(100, 100, 105)));
+                    for c in 0..total_cols {
+                        let col_letter = if c < 26 {
+                            ((b'A' + c as u8) as char).to_string()
+                        } else {
+                            format!("C{}", c + 1)
+                        };
+                        ui.label(
+                            egui::RichText::new(col_letter)
+                                .strong()
+                                .color(egui::Color32::from_rgb(150, 150, 210)),
+                        );
+                    }
+                    ui.end_row();
+
+                    for (row_idx, row) in rows.iter().enumerate() {
+                        if !search_filter.is_empty() {
+                            let match_found = row.iter().any(|cell| {
+                                cell.to_lowercase().contains(&search_filter.to_lowercase())
+                            });
+                            if !match_found {
+                                continue;
+                            }
+                        }
+
+                        // Row index
+                        ui.label(
+                            egui::RichText::new(format!("{}", row_idx + 1))
+                                .monospace()
+                                .color(egui::Color32::from_rgb(100, 100, 105)),
+                        );
+
+                        for cell in row {
+                            let text = if cell.is_empty() { " " } else { cell.as_str() };
+                            ui.label(text);
+                        }
+                        for _ in row.len()..total_cols {
+                            ui.label("");
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
+}
+
+fn render_presentation_viewer(
+    ui: &mut egui::Ui,
+    slides: &[SlideInfo],
+    current_slide: &mut usize,
+) {
+    if slides.is_empty() {
+        ui.centered_and_justified(|ui| {
+            ui.label("Empty presentation");
+        });
+        return;
+    }
+
+    let slide_count = slides.len();
+    if *current_slide >= slide_count {
+        *current_slide = 0;
+    }
+
+    ui.horizontal(|ui| {
+        if ui.button("◀ Prev Slide").on_hover_text("PageUp").clicked() && *current_slide > 0 {
+            *current_slide -= 1;
+        }
+        ui.label(
+            egui::RichText::new(format!("Slide {} of {}", *current_slide + 1, slide_count))
+                .strong()
+                .color(egui::Color32::WHITE),
+        );
+        if ui.button("Next Slide ▶").on_hover_text("PageDown").clicked() && *current_slide + 1 < slide_count {
+            *current_slide += 1;
+        }
+    });
+
+    ui.separator();
+
+    let slide = &slides[*current_slide];
+
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        ui.vertical_centered(|ui| {
+            ui.add_space(16.0);
+            egui::Frame::canvas(ui.style())
+                .fill(egui::Color32::from_rgb(32, 34, 40))
+                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(60, 62, 70)))
+                .rounding(egui::Rounding::same(8.0))
+                .inner_margin(egui::Margin::same(32.0))
+                .show(ui, |ui| {
+                    ui.set_min_width(600.0);
+                    ui.set_min_height(340.0);
+
+                    ui.heading(
+                        egui::RichText::new(&slide.title)
+                            .size(24.0)
+                            .strong()
+                            .color(egui::Color32::WHITE),
+                    );
+                    ui.separator();
+                    ui.add_space(12.0);
+
+                    for bullet in &slide.bullets {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("▸").color(egui::Color32::from_rgb(0, 122, 255)).size(15.0));
+                            ui.label(
+                                egui::RichText::new(bullet)
+                                    .size(15.0)
+                                    .color(egui::Color32::from_rgb(220, 220, 225)),
+                            );
+                        });
+                        ui.add_space(4.0);
+                    }
+                });
+        });
+    });
+}
+
+fn render_document_viewer(ui: &mut egui::Ui, paragraphs: &[DocParagraph], word_count: usize) {
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(format!("Word Document · ~{word_count} words · {} paragraphs", paragraphs.len()))
+                .color(egui::Color32::from_rgb(142, 142, 147))
+                .size(12.0),
+        );
+    });
+    ui.separator();
+
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        ui.vertical_centered(|ui| {
+            egui::Frame::canvas(ui.style())
+                .fill(egui::Color32::from_rgb(30, 30, 32))
+                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(50, 50, 56)))
+                .rounding(egui::Rounding::same(6.0))
+                .inner_margin(egui::Margin::symmetric(40.0, 30.0))
+                .show(ui, |ui| {
+                    ui.set_max_width(700.0);
+
+                    for para in paragraphs {
+                        if para.is_heading {
+                            ui.add_space(10.0);
+                            ui.heading(
+                                egui::RichText::new(&para.text)
+                                    .size(19.0)
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
+                            );
+                            ui.add_space(4.0);
+                        } else {
+                            ui.label(
+                                egui::RichText::new(&para.text)
+                                    .size(14.0)
+                                    .color(egui::Color32::from_rgb(220, 220, 225)),
+                            );
+                            ui.add_space(6.0);
+                        }
+                    }
+                });
+        });
+    });
 }
 
 fn render_directory_viewer(
@@ -1023,6 +1310,352 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+fn read_zip_entry(path: &Path, filter: impl Fn(&str) -> bool) -> Vec<(String, Vec<u8>)> {
+    let mut results = Vec::new();
+    let mut file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return results,
+    };
+    let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut buffer = [0u8; 4];
+    let mut offset = 0u64;
+
+    while offset + 30 <= file_size && results.len() < 100 {
+        if file.seek(SeekFrom::Start(offset)).is_err() {
+            break;
+        }
+        if file.read_exact(&mut buffer).is_err() {
+            break;
+        }
+        if buffer != [0x50, 0x4b, 0x03, 0x04] {
+            break;
+        }
+
+        let mut header = [0u8; 26];
+        if file.read_exact(&mut header).is_err() {
+            break;
+        }
+
+        let method = u16::from_le_bytes(header[4..6].try_into().unwrap());
+        let comp_size = u32::from_le_bytes(header[14..18].try_into().unwrap()) as usize;
+        let name_len = u16::from_le_bytes(header[22..24].try_into().unwrap()) as usize;
+        let extra_len = u16::from_le_bytes(header[24..26].try_into().unwrap()) as usize;
+
+        let mut name_bytes = vec![0u8; name_len];
+        if file.read_exact(&mut name_bytes).is_err() {
+            break;
+        }
+
+        let name = String::from_utf8_lossy(&name_bytes).to_string();
+        let data_offset = offset + 30 + (name_len as u64) + (extra_len as u64);
+
+        if filter(&name) {
+            if file.seek(SeekFrom::Start(data_offset)).is_ok() {
+                let mut comp_data = vec![0u8; comp_size];
+                if file.read_exact(&mut comp_data).is_ok() {
+                    let decompressed = if method == 0 {
+                        Some(comp_data)
+                    } else if method == 8 {
+                        miniz_oxide::inflate::decompress_to_vec(&comp_data).ok()
+                    } else {
+                        None
+                    };
+                    if let Some(data) = decompressed {
+                        results.push((name, data));
+                    }
+                }
+            }
+        }
+
+        offset = data_offset + (comp_size as u64);
+    }
+
+    results
+}
+
+fn load_pptx(path: &Path) -> FileKind {
+    let entries = read_zip_entry(path, |name| {
+        (name.starts_with("ppt/slides/slide") && name.ends_with(".xml"))
+            || (name.starts_with("content.xml"))
+    });
+
+    let mut slides_data = Vec::new();
+    for (name, data) in entries {
+        if name.starts_with("ppt/slides/slide") || name == "content.xml" {
+            slides_data.push((name, data));
+        }
+    }
+
+    slides_data.sort_by_key(|(name, _)| {
+        name.trim_start_matches("ppt/slides/slide")
+            .trim_end_matches(".xml")
+            .parse::<usize>()
+            .unwrap_or(0)
+    });
+
+    let mut slides = Vec::new();
+    for (_, data) in slides_data {
+        if let Ok(xml) = std::str::from_utf8(&data) {
+            let texts = extract_xml_tags(xml, "a:t");
+            if !texts.is_empty() {
+                let title = texts[0].clone();
+                let bullets = texts[1..].to_vec();
+                slides.push(SlideInfo { title, bullets });
+            } else {
+                slides.push(SlideInfo {
+                    title: format!("Slide {}", slides.len() + 1),
+                    bullets: vec![],
+                });
+            }
+        }
+    }
+
+    if slides.is_empty() {
+        slides.push(SlideInfo {
+            title: "Presentation".into(),
+            bullets: vec!["No text extracted or slide in vector graphics format".into()],
+        });
+    }
+
+    FileKind::Presentation {
+        slides,
+        current_slide: 0,
+    }
+}
+
+fn load_xlsx(path: &Path) -> FileKind {
+    let entries = read_zip_entry(path, |name| {
+        name == "xl/sharedStrings.xml"
+            || name == "xl/worksheets/sheet1.xml"
+            || name == "content.xml"
+    });
+
+    let mut shared_strings = Vec::new();
+    let mut sheet_xml = None;
+
+    for (name, data) in entries {
+        if name == "xl/sharedStrings.xml" {
+            if let Ok(xml) = std::str::from_utf8(&data) {
+                shared_strings = extract_xml_tags(xml, "t");
+            }
+        } else if name == "xl/worksheets/sheet1.xml" || name == "content.xml" {
+            if let Ok(xml) = std::str::from_utf8(&data) {
+                sheet_xml = Some(xml.to_string());
+            }
+        }
+    }
+
+    if let Some(xml) = sheet_xml {
+        let rows = parse_xlsx_sheet(&xml, &shared_strings);
+        let total_rows = rows.len();
+        let total_cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+        return FileKind::Spreadsheet {
+            rows,
+            total_rows,
+            total_cols,
+        };
+    }
+
+    FileKind::Error("Could not extract spreadsheet sheet".into())
+}
+
+fn parse_xlsx_sheet(xml: &str, shared_strings: &[String]) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    let mut row_cursor = 0;
+
+    while let Some(r_start) = xml[row_cursor..].find("<row") {
+        let abs_r_start = row_cursor + r_start;
+        if let Some(r_end) = xml[abs_r_start..].find("</row>") {
+            let row_xml = &xml[abs_r_start..abs_r_start + r_end];
+            let mut cells = Vec::new();
+            let mut c_cursor = 0;
+
+            while let Some(c_start) = row_xml[c_cursor..].find("<c") {
+                let abs_c_start = c_cursor + c_start;
+                if let Some(c_tag_close) = row_xml[abs_c_start..].find('>') {
+                    let c_header = &row_xml[abs_c_start..abs_c_start + c_tag_close];
+                    let is_shared = c_header.contains("t=\"s\"");
+
+                    let cell_content_end = row_xml[abs_c_start..].find("</c>").unwrap_or(c_tag_close);
+                    let cell_body = &row_xml[abs_c_start + c_tag_close..abs_c_start + cell_content_end];
+
+                    let mut val = String::new();
+                    if let Some(v_start) = cell_body.find("<v>") {
+                        if let Some(v_end) = cell_body[v_start + 3..].find("</v>") {
+                            let raw_v = &cell_body[v_start + 3..v_start + 3 + v_end];
+                            if is_shared {
+                                if let Ok(idx) = raw_v.trim().parse::<usize>() {
+                                    if idx < shared_strings.len() {
+                                        val = shared_strings[idx].clone();
+                                    }
+                                }
+                            } else {
+                                val = raw_v.trim().to_string();
+                            }
+                        }
+                    }
+                    cells.push(val);
+                    c_cursor = abs_c_start + cell_content_end;
+                } else {
+                    break;
+                }
+            }
+
+            if !cells.is_empty() {
+                rows.push(cells);
+            }
+            if rows.len() >= 500 {
+                break;
+            }
+            row_cursor = abs_r_start + r_end + 6;
+        } else {
+            break;
+        }
+    }
+    rows
+}
+
+fn load_docx(path: &Path) -> FileKind {
+    let entries = read_zip_entry(path, |name| name == "word/document.xml" || name == "content.xml");
+    if let Some((_, data)) = entries.into_iter().next() {
+        if let Ok(xml) = std::str::from_utf8(&data) {
+            let paragraphs = extract_docx_paragraphs(xml);
+            let word_count: usize = paragraphs
+                .iter()
+                .map(|p| p.text.split_whitespace().count())
+                .sum();
+            return FileKind::Document {
+                paragraphs,
+                word_count,
+            };
+        }
+    }
+    FileKind::Error("Could not read Word document contents".into())
+}
+
+fn extract_docx_paragraphs(xml: &str) -> Vec<DocParagraph> {
+    let mut paragraphs = Vec::new();
+    let mut cursor = 0;
+
+    while let Some(p_start) = xml[cursor..].find("<w:p") {
+        let abs_p_start = cursor + p_start;
+        if let Some(p_end) = xml[abs_p_start..].find("</w:p>") {
+            let p_body = &xml[abs_p_start..abs_p_start + p_end];
+            let is_heading = p_body.contains("Heading") || p_body.contains("heading");
+            let text_parts = extract_xml_tags(p_body, "w:t");
+            let text = text_parts.join("");
+            if !text.trim().is_empty() {
+                paragraphs.push(DocParagraph {
+                    text: text.trim().to_string(),
+                    is_heading,
+                });
+            }
+            cursor = abs_p_start + p_end + 6;
+        } else {
+            break;
+        }
+    }
+    paragraphs
+}
+
+fn load_csv_or_tsv(content: &str, delimiter: char) -> FileKind {
+    let mut rows = Vec::new();
+    for line in content.lines().take(500) {
+        let cols: Vec<String> = line
+            .split(delimiter)
+            .map(|s| s.trim_matches('"').trim().to_string())
+            .collect();
+        rows.push(cols);
+    }
+    let total_rows = rows.len();
+    let total_cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    FileKind::Spreadsheet {
+        rows,
+        total_rows,
+        total_cols,
+    }
+}
+
+fn load_legacy_office(path: &Path, kind_name: &'static str) -> FileKind {
+    let mut text_runs = Vec::new();
+    if let Ok(mut f) = File::open(path) {
+        let mut buf = Vec::new();
+        if f.read_to_end(&mut buf).is_ok() {
+            let mut current = String::new();
+            for &byte in &buf {
+                if byte.is_ascii_graphic() || byte == b' ' {
+                    current.push(byte as char);
+                } else {
+                    if current.trim().len() >= 4 {
+                        text_runs.push(current.trim().to_string());
+                    }
+                    current.clear();
+                }
+                if text_runs.len() >= 60 {
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut paragraphs = vec![DocParagraph {
+        is_heading: true,
+        text: format!("{kind_name} (Legacy Format)"),
+    }];
+
+    for text in text_runs {
+        paragraphs.push(DocParagraph {
+            is_heading: false,
+            text,
+        });
+    }
+
+    FileKind::Document {
+        paragraphs,
+        word_count: 0,
+    }
+}
+
+fn extract_xml_tags(xml: &str, tag: &str) -> Vec<String> {
+    let mut results = Vec::new();
+    let start_pattern = format!("<{tag}");
+    let end_pattern = format!("</{tag}>");
+    let mut cursor = 0;
+
+    while let Some(start_idx) = xml[cursor..].find(&start_pattern) {
+        let abs_start = cursor + start_idx;
+        let after_tag = abs_start + start_pattern.len();
+        if after_tag < xml.len() {
+            let next_ch = xml.as_bytes()[after_tag];
+            if next_ch != b'>' && next_ch != b' ' && next_ch != b'/' {
+                cursor = after_tag;
+                continue;
+            }
+        }
+        if let Some(close_bracket) = xml[abs_start..].find('>') {
+            let val_start = abs_start + close_bracket + 1;
+            if let Some(end_idx) = xml[val_start..].find(&end_pattern) {
+                let text = &xml[val_start..val_start + end_idx];
+                if !text.is_empty() {
+                    results.push(decode_xml_entities(text));
+                }
+                cursor = val_start + end_idx + end_pattern.len();
+                continue;
+            }
+        }
+        cursor = abs_start + start_pattern.len();
+    }
+    results
+}
+
+fn decode_xml_entities(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1051,5 +1684,25 @@ mod tests {
         let siblings = get_siblings(Path::new("Cargo.toml"));
         assert!(!siblings.is_empty());
         assert!(siblings.iter().any(|p| p.file_name().unwrap() == "Cargo.toml"));
+    }
+
+    #[test]
+    fn test_extract_xml_tags() {
+        let xml = "<p><a:t>Slide Title</a:t><other><a:t>Bullet 1</a:t></other></p>";
+        let tags = extract_xml_tags(xml, "a:t");
+        assert_eq!(tags, vec!["Slide Title", "Bullet 1"]);
+    }
+
+    #[test]
+    fn test_csv_parser() {
+        let csv = "Name,Age,City\nAlice,30,Berlin\nBob,25,Paris";
+        if let FileKind::Spreadsheet { rows, total_rows, total_cols } = load_csv_or_tsv(csv, ',') {
+            assert_eq!(total_rows, 3);
+            assert_eq!(total_cols, 3);
+            assert_eq!(rows[0], vec!["Name", "Age", "City"]);
+            assert_eq!(rows[1], vec!["Alice", "30", "Berlin"]);
+        } else {
+            panic!("Expected spreadsheet");
+        }
     }
 }

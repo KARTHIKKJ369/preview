@@ -16,6 +16,9 @@ macOS Quick Look achieves its instant, zero-lag feel through four core design de
 | Category | Formats | Viewer Capabilities |
 | :--- | :--- | :--- |
 | **Images** | PNG, JPG, JPEG, GIF, WEBP, BMP, SVG, ICO, TIFF | GPU-rendered, auto-fit, drag-to-pan, scroll-wheel zoom, dimensions (`W × H px`) |
+| **Presentations** | `.pptx`, `.ppt`, `.odp` | Slide deck viewer: 16:9 canvas, slide titles, bullet points, slide count, Next/Prev slide navigation (`PageUp`/`PageDown`) |
+| **Spreadsheets** | `.xlsx`, `.xls`, `.ods`, `.csv`, `.tsv` | Interactive spreadsheet grid: column headers (A, B, C...), row numbering, filter/search, cell table view |
+| **Documents** | `.docx`, `.doc`, `.odt`, `.rtf` | Formatted document viewer: headings, paragraphs, word & paragraph count |
 | **Code & Text** | `.rs`, `.py`, `.js`, `.ts`, `.c`, `.cpp`, `.go`, `.java`, `.sh`, `.json`, `.toml`, `.yaml`, `.html`, `.css`, etc. | Syntax-highlighted (Syntect), line numbers, monospace font, 512KB streaming limit to prevent UI lockup |
 | **Markdown** | `.md`, `.markdown` | Formatted headers, blockquotes, code blocks, bullet points |
 | **Directories** | Any directory / folder | File count, folder contents table with file icons, sizes, and relative modification timestamps |
