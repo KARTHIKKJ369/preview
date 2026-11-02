@@ -1137,167 +1137,170 @@ fn render_presentation_viewer(
         *current_slide = 0;
     }
 
-    let total_rect = ui.available_rect_before_wrap();
-    let sidebar_width = 138.0_f32;
-
-    ui.horizontal(|ui| {
-        // --- LEFT SIDEBAR: Slide Thumbnails (Screenshot 3) ---
-        egui::Frame::canvas(ui.style())
-            .fill(egui::Color32::from_rgb(20, 20, 22))
-            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(36, 36, 40)))
-            .inner_margin(egui::Margin::symmetric(8.0, 10.0))
-            .show(ui, |ui| {
-                ui.set_width(sidebar_width);
-                ui.set_height(total_rect.height());
-
-                egui::ScrollArea::vertical()
-                    .id_salt("pptx_slide_thumbs")
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = 10.0;
-                        for (idx, slide) in slides.iter().enumerate() {
-                            let is_selected = idx == *current_slide;
-                            let card_size = egui::vec2(120.0, 68.0); // 16:9 ratio
-
-                            let (rect, response) = ui.allocate_exact_size(card_size, egui::Sense::click());
-                            if response.clicked() {
-                                *current_slide = idx;
-                            }
-
-                            let painter = ui.painter_at(rect);
-                            let border_stroke = if is_selected {
-                                egui::Stroke::new(2.5_f32, egui::Color32::from_rgb(0, 122, 255))
-                            } else if response.hovered() {
-                                egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(120, 120, 125))
-                            } else {
-                                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(55, 55, 60))
-                            };
-
-                            // Miniature white slide sheet
-                            painter.rect(
-                                rect,
-                                egui::Rounding::same(4.0),
-                                egui::Color32::WHITE,
-                                border_stroke,
-                            );
-
-                            // Slide text in thumbnail
-                            let mini_title = if slide.title.len() > 18 {
-                                format!("{}...", &slide.title[..18])
-                            } else {
-                                slide.title.clone()
-                            };
-
-                            painter.text(
-                                rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                mini_title,
-                                egui::FontId::proportional(8.5),
-                                egui::Color32::from_rgb(30, 30, 35),
-                            );
-
-                            // Miniature slide number label
-                            ui.vertical_centered(|ui| {
-                                ui.label(
-                                    egui::RichText::new(format!("Slide {}", idx + 1))
-                                        .size(10.5)
-                                        .color(if is_selected {
-                                            egui::Color32::from_rgb(0, 122, 255)
-                                        } else {
-                                            egui::Color32::from_rgb(140, 140, 145)
-                                        }),
-                                );
-                            });
-                        }
-                    });
-            });
-
-        ui.separator();
-
-        // --- MAIN VIEWPORT: 16:9 Presentation Canvas (Screenshot 3) ---
-        let main_avail = ui.available_size();
-        let target_aspect = 16.0 / 9.0;
-
-        let padding = 24.0;
-        let mut slide_w = main_avail.x - padding * 2.0;
-        let mut slide_h = slide_w / target_aspect;
-
-        if slide_h > (main_avail.y - padding * 2.0) {
-            slide_h = (main_avail.y - padding * 2.0).max(100.0);
-            slide_w = slide_h * target_aspect;
-        }
-
-        let slide = &slides[*current_slide];
-
-        ui.vertical_centered(|ui| {
-            let v_space = ((main_avail.y - slide_h) / 2.0).max(8.0);
-            ui.add_space(v_space);
-
-            egui::Frame::canvas(ui.style())
-                .fill(egui::Color32::WHITE)
-                .rounding(egui::Rounding::same(10.0))
-                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(215, 215, 220)))
-                .shadow(egui::epaint::Shadow {
-                    offset: egui::vec2(0.0, 4.0),
-                    blur: 12.0,
-                    spread: 2.0,
-                    color: egui::Color32::from_black_alpha(45),
-                })
-                .inner_margin(egui::Margin::same(44.0))
+    // Left thumbnail strip — proper egui SidePanel so height fills correctly
+    let current_idx = *current_slide;
+    egui::SidePanel::left("pptx_thumbs")
+        .exact_width(146.0)
+        .resizable(false)
+        .frame(
+            egui::Frame::none()
+                .fill(egui::Color32::from_rgb(20, 20, 22))
+                .inner_margin(egui::Margin::symmetric(8.0, 10.0)),
+        )
+        .show_inside(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("pptx_slide_thumbs")
+                .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    ui.set_width(slide_w);
-                    ui.set_height(slide_h);
+                    ui.spacing_mut().item_spacing.y = 8.0;
+                    for (idx, slide) in slides.iter().enumerate() {
+                        let is_selected = idx == current_idx;
+                        // 16:9 thumbnail
+                        let card_size = egui::vec2(122.0, 69.0);
+                        let (rect, response) =
+                            ui.allocate_exact_size(card_size, egui::Sense::click());
+                        if response.clicked() {
+                            *current_slide = idx;
+                        }
 
-                    if slide.is_title_slide || slide.bullets.is_empty() {
-                        // Title slide: vertically & horizontally centered (e.g. "NETWORK LAYER")
-                        ui.centered_and_justified(|ui| {
+                        let painter = ui.painter_at(rect);
+                        let border_color = if is_selected {
+                            egui::Color32::from_rgb(0, 122, 255)
+                        } else if response.hovered() {
+                            egui::Color32::from_rgb(120, 120, 125)
+                        } else {
+                            egui::Color32::from_rgb(55, 55, 60)
+                        };
+                        let border_w = if is_selected { 2.5_f32 } else { 1.0_f32 };
+
+                        painter.rect(
+                            rect,
+                            egui::Rounding::same(3.0),
+                            egui::Color32::WHITE,
+                            egui::Stroke::new(border_w, border_color),
+                        );
+
+                        let mini_title: String = slide.title.chars().take(20).collect();
+                        painter.text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            mini_title,
+                            egui::FontId::proportional(8.0),
+                            egui::Color32::from_rgb(30, 30, 35),
+                        );
+
+                        // slide number below card
+                        ui.vertical_centered(|ui| {
                             ui.label(
-                                egui::RichText::new(&slide.title)
-                                    .size(36.0)
-                                    .strong()
-                                    .color(egui::Color32::from_rgb(20, 20, 24)),
+                                egui::RichText::new(format!("{}", idx + 1))
+                                    .size(10.0)
+                                    .color(if is_selected {
+                                        egui::Color32::from_rgb(0, 122, 255)
+                                    } else {
+                                        egui::Color32::from_rgb(120, 120, 125)
+                                    }),
                             );
                         });
-                    } else {
-                        // Content slide: Title at top + divider + bullets
-                        ui.label(
-                            egui::RichText::new(&slide.title)
-                                .size(26.0)
-                                .strong()
-                                .color(egui::Color32::from_rgb(20, 20, 24)),
-                        );
-
-                        ui.add_space(8.0);
-                        let line_rect = egui::Rect::from_min_size(
-                            ui.cursor().min,
-                            egui::vec2(ui.available_width(), 1.5),
-                        );
-                        ui.painter().rect_filled(
-                            line_rect,
-                            0.0,
-                            egui::Color32::from_rgb(225, 225, 230),
-                        );
-                        ui.add_space(18.0);
-
-                        for bullet in &slide.bullets {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new("•")
-                                        .size(16.0)
-                                        .color(egui::Color32::from_rgb(0, 122, 255)),
-                                );
-                                ui.add_space(6.0);
-                                ui.label(
-                                    egui::RichText::new(bullet)
-                                        .size(16.0)
-                                        .color(egui::Color32::from_rgb(40, 40, 45)),
-                                );
-                            });
-                            ui.add_space(8.0);
-                        }
                     }
                 });
         });
-    });
+
+    // Main 16:9 slide canvas
+    egui::CentralPanel::default()
+        .frame(
+            egui::Frame::none()
+                .fill(egui::Color32::from_rgb(38, 38, 42))
+                .inner_margin(egui::Margin::same(0.0)),
+        )
+        .show_inside(ui, |ui| {
+            let avail = ui.available_size();
+            let pad = 28.0_f32;
+            let mut slide_w = avail.x - pad * 2.0;
+            let mut slide_h = slide_w / (16.0 / 9.0);
+            if slide_h > avail.y - pad * 2.0 {
+                slide_h = (avail.y - pad * 2.0).max(60.0);
+                slide_w = slide_h * (16.0 / 9.0);
+            }
+            slide_w = slide_w.max(100.0);
+            slide_h = slide_h.max(60.0);
+
+            let slide = &slides[*current_slide];
+
+            ui.vertical_centered(|ui| {
+                let v_pad = ((avail.y - slide_h) * 0.5).max(pad);
+                ui.add_space(v_pad);
+
+                egui::Frame::none()
+                    .fill(egui::Color32::WHITE)
+                    .rounding(egui::Rounding::same(8.0))
+                    .stroke(egui::Stroke::new(
+                        1.0_f32,
+                        egui::Color32::from_rgb(210, 210, 215),
+                    ))
+                    .shadow(egui::epaint::Shadow {
+                        offset: egui::vec2(0.0, 6.0),
+                        blur: 18.0,
+                        spread: 0.0,
+                        color: egui::Color32::from_black_alpha(60),
+                    })
+                    .inner_margin(egui::Margin::symmetric(40.0, 32.0))
+                    .show(ui, |ui| {
+                        ui.set_min_size(egui::vec2(slide_w, slide_h));
+                        ui.set_max_size(egui::vec2(slide_w, slide_h));
+
+                        if slide.is_title_slide || slide.bullets.is_empty() {
+                            ui.centered_and_justified(|ui| {
+                                ui.label(
+                                    egui::RichText::new(&slide.title)
+                                        .size(38.0)
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(18, 18, 22)),
+                                );
+                            });
+                        } else {
+                            ui.label(
+                                egui::RichText::new(&slide.title)
+                                    .size(24.0)
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(18, 18, 22)),
+                            );
+                            ui.add_space(6.0);
+                            let sep_rect = egui::Rect::from_min_size(
+                                ui.cursor().min,
+                                egui::vec2(ui.available_width(), 1.5),
+                            );
+                            ui.painter().rect_filled(
+                                sep_rect,
+                                0.0,
+                                egui::Color32::from_rgb(220, 220, 228),
+                            );
+                            ui.add_space(16.0);
+
+                            egui::ScrollArea::vertical()
+                                .id_salt("slide_body")
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    for bullet in &slide.bullets {
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new("•")
+                                                    .size(15.0)
+                                                    .color(egui::Color32::from_rgb(0, 122, 255)),
+                                            );
+                                            ui.add_space(4.0);
+                                            ui.label(
+                                                egui::RichText::new(bullet)
+                                                    .size(15.0)
+                                                    .color(egui::Color32::from_rgb(36, 36, 42)),
+                                            );
+                                        });
+                                        ui.add_space(6.0);
+                                    }
+                                });
+                        }
+                    });
+            });
+        });
 }
 
 fn render_document_viewer(ui: &mut egui::Ui, paragraphs: &[DocParagraph], word_count: usize) {
@@ -1433,161 +1436,143 @@ fn render_pdf_viewer(
     pan_offset: &mut egui::Vec2,
 ) -> Option<usize> {
     let mut page_change = None;
-    let total_rect = ui.available_rect_before_wrap();
-    let sidebar_width = 118.0_f32;
 
-    ui.horizontal(|ui| {
-        // --- MAIN PDF VIEWPORT (Center/Left) ---
-        let main_width = (total_rect.width() - sidebar_width - 8.0).max(100.0);
-        ui.allocate_ui_with_layout(
-            egui::vec2(main_width, total_rect.height()),
-            egui::Layout::top_down(egui::Align::Center),
-            |ui| {
-                if let Some(tex) = texture {
-                    render_texture_interactive(ui, tex, zoom_scale, pan_offset);
-                } else {
-                    ui.centered_and_justified(|ui| {
-                        egui::Frame::canvas(ui.style())
-                            .fill(egui::Color32::WHITE)
-                            .rounding(egui::Rounding::same(8.0))
-                            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(220, 220, 225)))
-                            .shadow(egui::epaint::Shadow {
-                                offset: egui::vec2(0.0, 4.0),
-                                blur: 10.0,
-                                spread: 2.0,
-                                color: egui::Color32::from_black_alpha(40),
-                            })
-                            .inner_margin(egui::Margin::same(36.0))
-                            .show(ui, |ui| {
-                                ui.set_min_size(egui::vec2(520.0, 700.0));
-                                ui.vertical_centered(|ui| {
-                                    ui.add_space(40.0);
-                                    ui.label(egui::RichText::new("📄").size(64.0));
-                                    ui.add_space(16.0);
-                                    ui.heading(
-                                        egui::RichText::new(
-                                            path.file_name()
-                                                .and_then(|s| s.to_str())
-                                                .unwrap_or("document.pdf"),
-                                        )
-                                        .size(20.0)
-                                        .color(egui::Color32::from_rgb(20, 20, 24)),
-                                    );
-                                    ui.add_space(6.0);
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "PDF Document · Page {} of {}",
-                                            *current_page, total_pages
-                                        ))
-                                        .color(egui::Color32::from_rgb(100, 100, 105))
-                                        .size(13.0),
-                                    );
-                                    ui.add_space(16.0);
-                                    ui.label(
-                                        egui::RichText::new(
-                                            "💡 To enable high-res page rendering, install poppler-utils:",
-                                        )
-                                        .color(egui::Color32::from_rgb(120, 120, 125))
-                                        .size(12.0),
-                                    );
-                                    ui.label(
-                                        egui::RichText::new(
-                                            "sudo apt install poppler-utils (or pacman -S poppler)",
-                                        )
-                                        .monospace()
-                                        .color(egui::Color32::from_rgb(0, 122, 255))
-                                        .size(12.0),
-                                    );
-                                    ui.add_space(20.0);
-                                    if ui.button("Open in Default PDF Viewer").clicked() {
-                                        let _ = open::that(path);
-                                    }
-                                });
-                            });
-                    });
-                }
-            },
-        );
+    // Right sidebar — page thumbnails
+    let cur = *current_page;
+    egui::SidePanel::right("pdf_thumbs")
+        .exact_width(110.0)
+        .resizable(false)
+        .frame(
+            egui::Frame::none()
+                .fill(egui::Color32::from_rgb(20, 20, 22))
+                .inner_margin(egui::Margin::symmetric(8.0, 10.0)),
+        )
+        .show_inside(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("pdf_page_thumbs")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 8.0;
+                    for page in 1..=total_pages {
+                        let is_selected = page == cur;
+                        // A4-ish ratio: 86×120
+                        let card_size = egui::vec2(86.0, 118.0);
+                        let (rect, response) =
+                            ui.allocate_exact_size(card_size, egui::Sense::click());
+                        if response.clicked() && page != cur {
+                            *current_page = page;
+                            page_change = Some(page);
+                        }
 
-        ui.separator();
+                        let painter = ui.painter_at(rect);
+                        let border_color = if is_selected {
+                            egui::Color32::from_rgb(0, 122, 255)
+                        } else if response.hovered() {
+                            egui::Color32::from_rgb(120, 120, 125)
+                        } else {
+                            egui::Color32::from_rgb(55, 55, 60)
+                        };
+                        let border_w = if is_selected { 2.5_f32 } else { 1.0_f32 };
 
-        // --- RIGHT SIDEBAR: Page Thumbnails (Screenshot 1) ---
-        egui::Frame::canvas(ui.style())
-            .fill(egui::Color32::from_rgb(20, 20, 22))
-            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(36, 36, 40)))
-            .inner_margin(egui::Margin::symmetric(8.0, 10.0))
-            .show(ui, |ui| {
-                ui.set_width(sidebar_width);
-                ui.set_height(total_rect.height());
+                        painter.rect(
+                            rect,
+                            egui::Rounding::same(3.0),
+                            egui::Color32::from_rgb(248, 248, 250),
+                            egui::Stroke::new(border_w, border_color),
+                        );
 
-                egui::ScrollArea::vertical()
-                    .id_salt("pdf_page_thumbs")
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = 10.0;
-                        for page in 1..=total_pages {
-                            let is_selected = page == *current_page;
-                            let card_size = egui::vec2(86.0, 120.0); // Standard A4 ratio
-
-                            let (rect, response) = ui.allocate_exact_size(card_size, egui::Sense::click());
-                            if response.clicked() && page != *current_page {
-                                *current_page = page;
-                                page_change = Some(page);
-                            }
-
-                            let painter = ui.painter_at(rect);
-                            let border_stroke = if is_selected {
-                                egui::Stroke::new(2.5_f32, egui::Color32::from_rgb(0, 122, 255))
-                            } else if response.hovered() {
-                                egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(120, 120, 125))
-                            } else {
-                                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(55, 55, 60))
+                        // Miniature text lines
+                        let line_color = egui::Color32::from_rgb(210, 210, 218);
+                        for li in 0..6u32 {
+                            let ly = rect.min.y + 14.0 + (li as f32 * 13.5);
+                            let lw = match li {
+                                0 => 38.0_f32,
+                                5 => 28.0_f32,
+                                _ => 60.0_f32,
                             };
-
-                            // Miniature page sheet
-                            painter.rect(
-                                rect,
-                                egui::Rounding::same(3.0),
-                                egui::Color32::from_rgb(248, 248, 250),
-                                border_stroke,
+                            painter.rect_filled(
+                                egui::Rect::from_min_size(
+                                    egui::pos2(rect.min.x + 10.0, ly),
+                                    egui::vec2(lw, 2.5),
+                                ),
+                                1.0,
+                                line_color,
                             );
+                        }
 
-                            // Subtle miniature text lines on thumbnail
-                            let line_color = egui::Color32::from_rgb(215, 215, 220);
-                            for li in 0..6 {
-                                let ly = rect.min.y + 16.0 + (li as f32 * 14.0);
-                                let lw = if li == 0 {
-                                    40.0
-                                } else if li == 5 {
-                                    30.0
-                                } else {
-                                    62.0
-                                };
-                                painter.rect_filled(
-                                    egui::Rect::from_min_size(
-                                        egui::pos2(rect.min.x + 12.0, ly),
-                                        egui::vec2(lw, 2.5),
-                                    ),
-                                    1.0,
-                                    line_color,
-                                );
-                            }
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!("{page}"))
+                                    .size(10.0)
+                                    .color(if is_selected {
+                                        egui::Color32::from_rgb(0, 122, 255)
+                                    } else {
+                                        egui::Color32::from_rgb(120, 120, 125)
+                                    }),
+                            );
+                        });
+                    }
+                });
+        });
 
-                            // Page number label below
-                            ui.vertical_centered(|ui| {
-                                ui.label(
-                                    egui::RichText::new(format!("Page {}", page))
-                                        .size(10.5)
-                                        .color(if is_selected {
-                                            egui::Color32::from_rgb(0, 122, 255)
-                                        } else {
-                                            egui::Color32::from_rgb(140, 140, 145)
-                                        }),
-                                );
-                            });
+    // Central PDF page view
+    egui::CentralPanel::default()
+        .frame(
+            egui::Frame::none()
+                .fill(egui::Color32::from_rgb(56, 56, 60))
+                .inner_margin(egui::Margin::same(0.0)),
+        )
+        .show_inside(ui, |ui| {
+            if let Some(tex) = texture {
+                render_texture_interactive(ui, tex, zoom_scale, pan_offset);
+            } else {
+                ui.centered_and_justified(|ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(40.0);
+                        ui.label(egui::RichText::new("📄").size(64.0));
+                        ui.add_space(16.0);
+                        ui.label(
+                            egui::RichText::new(
+                                path.file_name()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or("document.pdf"),
+                            )
+                            .size(20.0)
+                            .strong()
+                            .color(egui::Color32::WHITE),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "PDF · Page {cur} of {total_pages}"
+                            ))
+                            .color(egui::Color32::from_rgb(160, 160, 168))
+                            .size(13.0),
+                        );
+                        ui.add_space(20.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "Install poppler-utils for page thumbnails:",
+                            )
+                            .color(egui::Color32::from_rgb(120, 120, 125))
+                            .size(12.0),
+                        );
+                        ui.label(
+                            egui::RichText::new(
+                                "sudo apt install poppler-utils",
+                            )
+                            .monospace()
+                            .color(egui::Color32::from_rgb(0, 122, 255))
+                            .size(12.0),
+                        );
+                        ui.add_space(20.0);
+                        if ui.button("Open in Default PDF Viewer").clicked() {
+                            let _ = open::that(path);
                         }
                     });
-            });
-    });
+                });
+            }
+        });
 
     page_change
 }
@@ -1712,77 +1697,98 @@ fn render_audio_player(
     let mut toggle_play = false;
     let mut seek_to = None;
     let mut nav_delta = None;
-    let available_rect = ui.available_rect_before_wrap();
 
     let meta = player.audio_meta.clone().unwrap_or_default();
     let display_title = if !meta.title.is_empty() {
         meta.title.clone()
     } else {
-        player.path.file_stem().and_then(|s| s.to_str()).unwrap_or("Audio Track").to_string()
+        player
+            .path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Audio Track")
+            .to_string()
     };
 
-    // 1. Central Card Area (Screenshot 2)
-    let body_height = (available_rect.height() - 56.0).max(120.0);
+    // 1. Central card area — fills all space above the transport bar
+    let transport_h = 52.0_f32;
+    let body_h = (ui.available_height() - transport_h - 4.0).max(100.0);
+
     ui.allocate_ui_with_layout(
-        egui::vec2(available_rect.width(), body_height),
+        egui::vec2(ui.available_width(), body_h),
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
-            ui.add_space(32.0);
+            ui.add_space(36.0);
 
-            // Left: Album Art Card (Screenshot 2: 170x170 px)
-            let art_size = egui::vec2(170.0, 170.0);
-            let (rect, _) = ui.allocate_exact_size(art_size, egui::Sense::hover());
-            let painter = ui.painter_at(rect);
+            // Album art — use allocate_painter so we get rect+painter in the right context
+            let art_size = egui::vec2(160.0, 160.0);
+            let (art_resp, art_painter) = ui.allocate_painter(art_size, egui::Sense::hover());
+            let art_rect = art_resp.rect;
 
             if let Some(tex) = texture {
-                let img = egui::Image::new(tex)
-                    .fit_to_exact_size(art_size)
-                    .rounding(egui::Rounding::same(12.0));
-                img.paint_at(ui, rect);
+                // Draw rounded album art directly via painter
+                art_painter.image(
+                    tex.id(),
+                    art_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+                // Rounded clip overlay (paint transparent round-rect over corners)
+                // Just draw a rounded border on top
+                art_painter.rect_stroke(
+                    art_rect,
+                    egui::Rounding::same(12.0),
+                    egui::Stroke::new(2.0_f32, egui::Color32::from_black_alpha(30)),
+                );
             } else {
-                // macOS Style placeholder tile
-                painter.rect_filled(rect, 12.0, egui::Color32::from_rgb(236, 236, 240));
-                painter.rect_stroke(rect, 12.0, egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(215, 215, 220)));
-                painter.text(
-                    rect.center(),
+                // Placeholder tile
+                art_painter.rect_filled(
+                    art_rect,
+                    egui::Rounding::same(12.0),
+                    egui::Color32::from_rgb(236, 236, 240),
+                );
+                art_painter.rect_stroke(
+                    art_rect,
+                    egui::Rounding::same(12.0),
+                    egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(210, 210, 218)),
+                );
+                art_painter.text(
+                    art_rect.center(),
                     egui::Align2::CENTER_CENTER,
-                    "🎵",
-                    egui::FontId::proportional(64.0),
-                    egui::Color32::from_rgb(175, 175, 180),
+                    "♪",
+                    egui::FontId::proportional(72.0),
+                    egui::Color32::from_rgb(170, 170, 178),
                 );
             }
 
-            ui.add_space(26.0);
+            ui.add_space(28.0);
 
-            // Right: Track Metadata Stack (Screenshot 2)
+            // Track metadata
             ui.vertical(|ui| {
-                ui.add_space(16.0);
+                ui.add_space(14.0);
 
-                // Track Title (Large, Bold, White)
                 ui.label(
                     egui::RichText::new(&display_title)
-                        .size(19.0)
+                        .size(20.0)
                         .strong()
                         .color(egui::Color32::WHITE),
                 );
 
                 ui.add_space(10.0);
 
-                // Artist
                 let artist_text = if !meta.artist.is_empty() {
                     format!("Artist: {}", meta.artist)
                 } else {
-                    "Artist: Unknown Artist".into()
+                    "Artist: Unknown".into()
                 };
                 ui.label(
                     egui::RichText::new(artist_text)
                         .size(13.5)
-                        .color(egui::Color32::from_rgb(165, 165, 170)),
+                        .color(egui::Color32::from_rgb(160, 160, 168)),
                 );
 
                 ui.add_space(4.0);
 
-                // Album
                 let album_text = if !meta.album.is_empty() {
                     format!("Album: {}", meta.album)
                 } else {
@@ -1791,31 +1797,32 @@ fn render_audio_player(
                 ui.label(
                     egui::RichText::new(album_text)
                         .size(13.5)
-                        .color(egui::Color32::from_rgb(165, 165, 170)),
+                        .color(egui::Color32::from_rgb(160, 160, 168)),
                 );
 
                 ui.add_space(4.0);
 
-                // Time
                 ui.label(
                     egui::RichText::new(format!("Time: {}", format_time(player.duration)))
                         .size(13.5)
-                        .color(egui::Color32::from_rgb(165, 165, 170)),
+                        .color(egui::Color32::from_rgb(160, 160, 168)),
                 );
             });
         },
     );
 
-    // 2. Bottom Transport Bar (Screenshot 2)
-    egui::Frame::canvas(ui.style())
+    // 2. Transport bar
+    egui::Frame::none()
         .fill(egui::Color32::from_rgb(22, 22, 24))
-        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(38, 38, 42)))
+        .stroke(egui::Stroke::new(
+            1.0_f32,
+            egui::Color32::from_rgb(38, 38, 44),
+        ))
         .inner_margin(egui::Margin::symmetric(14.0, 8.0))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
 
-                // ⏪ 15 (Rewind 15s)
                 if ui
                     .button(egui::RichText::new("⟲15").size(13.0))
                     .on_hover_text("Rewind 15 seconds")
@@ -1824,17 +1831,15 @@ fn render_audio_player(
                     seek_to = Some((player.current_time - 15.0).max(0.0));
                 }
 
-                // Play / Pause (⏸ / ▶)
                 let play_icon = if player.is_playing { "⏸" } else { "▶" };
                 if ui
                     .button(egui::RichText::new(play_icon).size(16.0).strong())
-                    .on_hover_text("Play / Pause (Click or press P)")
+                    .on_hover_text("Play / Pause (P)")
                     .clicked()
                 {
                     toggle_play = true;
                 }
 
-                // 15 ⏩ (Forward 15s)
                 if ui
                     .button(egui::RichText::new("15⟳").size(13.0))
                     .on_hover_text("Forward 15 seconds")
@@ -1843,7 +1848,6 @@ fn render_audio_player(
                     seek_to = Some((player.current_time + 15.0).min(player.duration));
                 }
 
-                // Elapsed Time
                 ui.label(
                     egui::RichText::new(format_time(player.current_time))
                         .monospace()
@@ -1851,20 +1855,17 @@ fn render_audio_player(
                         .color(egui::Color32::from_rgb(190, 190, 195)),
                 );
 
-                // Scrubber Slider
                 let mut slider_val = player.current_time;
-                let slider_width = (ui.available_width() - 95.0).max(80.0);
+                let slider_width = (ui.available_width() - 90.0).max(60.0);
                 let slider_resp = ui.add_sized(
                     [slider_width, 18.0],
                     egui::Slider::new(&mut slider_val, 0.0..=player.duration.max(1.0))
                         .show_value(false),
                 );
-
                 if slider_resp.changed() {
                     seek_to = Some(slider_val);
                 }
 
-                // Total Duration
                 ui.label(
                     egui::RichText::new(format_time(player.duration))
                         .monospace()
@@ -1872,13 +1873,12 @@ fn render_audio_player(
                         .color(egui::Color32::from_rgb(140, 140, 145)),
                 );
 
-                // Next Track >>
                 if ui
                     .button(egui::RichText::new(">>").size(13.0))
-                    .on_hover_text("Next Sibling File")
+                    .on_hover_text("Next file")
                     .clicked()
                 {
-                    nav_delta = Some(1);
+                    nav_delta = Some(1_isize);
                 }
             });
         });
