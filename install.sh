@@ -48,29 +48,56 @@ EOF
 cp "${KIO_DIR}/quicklook.desktop" "${KSERVICES_DIR}/quicklook.desktop"
 chmod +x "${KIO_DIR}/quicklook.desktop" "${KSERVICES_DIR}/quicklook.desktop"
 
-# Auto-configure Spacebar shortcut inside Dolphin (KDE 5 & KDE 6)
-for rc_dir in "${HOME}/.local/share/kxmlgui5/dolphin" "${HOME}/.local/share/kxmlgui6/dolphin" "${HOME}/.config/kxmlgui5/dolphin" "${HOME}/.config/kxmlgui6/dolphin"; do
-    mkdir -p "${rc_dir}"
-    rc_file="${rc_dir}/dolphinui.rc"
-    if [ ! -f "${rc_file}" ]; then
-        cat << 'EOF' > "${rc_file}"
-<!DOCTYPE gui SYSTEM 'kpartgui.dtd'>
-<gui name="dolphin">
- <ActionProperties scheme="default">
-  <Action name="servicemenu_quicklook.desktop::quicklook" shortcut="Space"/>
- </ActionProperties>
-</gui>
+# Auto-configure Spacebar shortcut inside Dolphin and unbind conflicting "Selection Mode"
+python3 - << 'EOF' 2>/dev/null || true
+import os
+
+dirs = [
+    os.path.expanduser("~/.local/share/kxmlgui5/dolphin"),
+    os.path.expanduser("~/.local/share/kxmlgui6/dolphin"),
+    os.path.expanduser("~/.config/kxmlgui5/dolphin"),
+    os.path.expanduser("~/.config/kxmlgui6/dolphin"),
+]
+
+injected = (
+    '  <Action name="toggle_selection_mode" shortcut=""/>\n'
+    '  <Action name="select_items" shortcut=""/>\n'
+    '  <Action name="servicemenu_quicklook.desktop::quicklook" shortcut="Space"/>'
+)
+
+for d in dirs:
+    os.makedirs(d, exist_ok=True)
+    p = os.path.join(d, "dolphinui.rc")
+    content = ""
+    if os.path.exists(p):
+        with open(p, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+
+    lines = [
+        line for line in content.splitlines()
+        if "servicemenu_quicklook.desktop::quicklook" not in line
+        and "toggle_selection_mode" not in line
+        and "select_items" not in line
+    ]
+    content = "\n".join(lines)
+
+    if "</ActionProperties>" in content:
+        content = content.replace("</ActionProperties>", injected + "\n </ActionProperties>")
+    elif "</gui>" in content:
+        content = content.replace("</gui>", ' <ActionProperties scheme="default">\n' + injected + '\n </ActionProperties>\n</gui>')
+    else:
+        content = (
+            "<!DOCTYPE gui SYSTEM 'kpartgui.dtd'>\n"
+            '<gui name="dolphin">\n'
+            ' <ActionProperties scheme="default">\n'
+            + injected +
+            '\n </ActionProperties>\n'
+            "</gui>\n"
+        )
+
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(content)
 EOF
-    else
-        if ! grep -q "servicemenu_quicklook.desktop::quicklook" "${rc_file}"; then
-            if grep -q "</ActionProperties>" "${rc_file}"; then
-                sed -i '/<\/ActionProperties>/i \  <Action name="servicemenu_quicklook.desktop::quicklook" shortcut="Space"/>' "${rc_file}"
-            elif grep -q "</gui>" "${rc_file}"; then
-                sed -i '/<\/gui>/i \ <ActionProperties scheme="default">\n  <Action name="servicemenu_quicklook.desktop::quicklook" shortcut="Space"/>\n </ActionProperties>' "${rc_file}"
-            fi
-        fi
-    fi
-done
 
 # Rebuild KDE service cache so Dolphin recognizes it immediately
 kbuildsycoca6 --noincremental 2>/dev/null || kbuildsycoca5 --noincremental 2>/dev/null || true
