@@ -1,10 +1,14 @@
 [Desktop Entry]
 Type=Application
 Name=Quick Look
+GenericName=File Previewer
 Comment=Fast, lightweight macOS-style file previewer
 Exec=quicklook %U
 Icon=system-search
 Terminal=false
 Categories=Utility;Viewer;
-MimeType=all/allfiles;
+MimeType=all/all;all/allfiles;inode/directory;
+StartupNotify=false
+X-KDE-SubstituteUID=false
+X-KDE-GlobalAccel-CommandShortcut=true
 

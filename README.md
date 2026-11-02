@@ -52,19 +52,23 @@ cargo build --release
 cp target/release/quicklook ~/.local/bin/
 ```
 
-### Linux File Manager Integration
+### Linux Desktop Integration (Out-of-the-Box)
 
-#### KDE Dolphin (Recommended macOS Experience)
-1. Run `./install.sh`. It automatically installs the Dolphin Service Menu to `~/.local/share/kio/servicemenus/quicklook.desktop`.
-2. In Dolphin, open **Settings → Configure Shortcuts** (or `Ctrl+Shift+,`).
-3. Search for **Quick Look** in the list.
-4. Set its shortcut to **Space**!
-5. Now, selecting any file in Dolphin and pressing **Space** opens Quick Look instantly.
+Running `./install.sh` automatically configures your desktop environment:
 
-#### GNOME Nautilus
-- Installed to `~/.local/share/nautilus/scripts/Quick Look` (Right-click any file -> Scripts -> Quick Look).
-- Or bind a custom shortcut (e.g. `Super+Space`) to `quicklook`.
+#### KDE Plasma & Dolphin
+- **Zero manual configuration needed**:
+  - Automatically installs Dolphin KIO service menus (`~/.local/share/kio/servicemenus/quicklook.desktop`).
+  - Sets executable permissions (`chmod +x`) required by KDE Plasma 6 security policies.
+  - Automatically writes the **Space** key binding directly into Dolphin's UI profile (`dolphinui.rc`).
+  - Refreshes KDE Sycoca service database (`kbuildsycoca6` / `kbuildsycoca5`).
+- Selecting any file in Dolphin and pressing **Space** immediately opens the preview.
+- Right-clicking any file also shows **Quick Look** in the context menu.
 
-#### Automatic Dolphin Selection Detection
-If `quicklook` is invoked from a global hotkey or terminal without arguments while Dolphin is focused, it automatically queries Dolphin's active selection over D-Bus (`org.kde.dolphin`) and previews the selected file without opening the directory.
+#### GNOME (Nautilus)
+- Automatically installed to `~/.local/share/nautilus/scripts/Quick Look`.
+- Right-click any file -> Scripts -> Quick Look, or bind a custom shortcut to `quicklook`.
+
+#### Cinnamon (Nemo), MATE (Caja), XFCE (Thunar)
+- Pre-configured actions installed to `~/.local/share/nemo/actions/` and Caja scripts folder.
 
