@@ -23,8 +23,8 @@ macOS Quick Look achieves its instant, zero-lag feel through four core design de
 | **Markdown** | `.md`, `.markdown` | Formatted headers, blockquotes, code blocks, bullet points |
 | **Directories** | Any directory / folder | File count, folder contents table with file icons, sizes, and relative modification timestamps |
 | **Archives** | `.zip`, `.jar`, `.war` | Direct header inspection listing archive contents without extracting |
-| **PDF** | `.pdf` | Page estimate count, document metadata, one-click open |
-| **Media** | Audio (`mp3`, `wav`, `flac`, `ogg`) & Video (`mp4`, `mkv`, `webm`, `mov`) | Media badge, file size, format details, external launcher |
+| **PDF** | `.pdf` | Visual in-window page rendering (poppler / Ghostscript / mutool / XDG cache), page counter, interactive PageUp/PageDown page flipping, zoom & pan |
+| **Video & Audio** | `.mp4`, `.mkv`, `.mov`, `.webm`, `.avi`, `.mp3`, `.wav`, `.flac`, `.ogg` | Visual video frame preview & album art extraction (ffmpeg / ffmpegthumbnailer / mpv / Dolphin XDG cache), "▶ Play in Player" quick button |
 | **Binary Fallback** | Any unknown binary (`.bin`, `.so`, `.dat`, executables) | 3-column macOS Quick Look-style Hex Viewer (`Offset`, `Hex`, `ASCII`) |
 
 ## Keyboard & Mouse Shortcuts

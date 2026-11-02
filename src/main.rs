@@ -107,10 +107,13 @@ pub enum FileKind {
         total_entries: usize,
     },
     Pdf {
-        page_estimate: Option<usize>,
+        current_page: usize,
+        total_pages: usize,
+        page_image: Option<egui::ColorImage>,
     },
     Media {
         kind: &'static str,
+        poster_image: Option<egui::ColorImage>,
     },
     Hex {
         data: Vec<u8>,
@@ -145,6 +148,7 @@ pub struct QuickLookApp {
     sibling_idx: usize,
     file_size: u64,
     file_kind: FileKind,
+    active_texture: Option<egui::TextureHandle>,
     zoom_scale: f32,
     pan_offset: egui::Vec2,
     search_filter: String,
@@ -158,6 +162,7 @@ impl QuickLookApp {
             sibling_idx: 0,
             file_size: 0,
             file_kind: FileKind::Welcome,
+            active_texture: None,
             zoom_scale: 1.0,
             pan_offset: egui::Vec2::ZERO,
             search_filter: String::new(),
@@ -174,6 +179,7 @@ impl QuickLookApp {
         self.siblings = get_siblings(&abs_path);
         self.sibling_idx = self.siblings.iter().position(|p| p == &abs_path).unwrap_or(0);
         self.current_path = Some(abs_path);
+        self.active_texture = None;
         self.zoom_scale = 1.0;
         self.pan_offset = egui::Vec2::ZERO;
         self.search_filter.clear();
@@ -188,6 +194,7 @@ impl QuickLookApp {
         let new_idx = ((self.sibling_idx as isize + delta).rem_euclid(len)) as usize;
         self.sibling_idx = new_idx;
         self.current_path = Some(self.siblings[new_idx].clone());
+        self.active_texture = None;
         self.zoom_scale = 1.0;
         self.pan_offset = egui::Vec2::ZERO;
         self.search_filter.clear();
@@ -291,11 +298,19 @@ impl QuickLookApp {
         // 6. Audio & Video
         match ext.as_str() {
             "mp3" | "wav" | "ogg" | "flac" | "aac" | "m4a" | "opus" => {
-                self.file_kind = FileKind::Media { kind: "Audio" };
+                let poster_image = extract_audio_art_to_image(path);
+                self.file_kind = FileKind::Media {
+                    kind: "Audio",
+                    poster_image,
+                };
                 return;
             }
             "mp4" | "mkv" | "mov" | "webm" | "avi" | "wmv" | "flv" => {
-                self.file_kind = FileKind::Media { kind: "Video" };
+                let poster_image = extract_video_frame_to_image(path);
+                self.file_kind = FileKind::Media {
+                    kind: "Video",
+                    poster_image,
+                };
                 return;
             }
             _ => {}
@@ -303,9 +318,12 @@ impl QuickLookApp {
 
         // 7. PDF
         if ext == "pdf" {
-            let pages = estimate_pdf_pages(path);
+            let total_pages = pdf_get_total_pages(path);
+            let page_image = render_pdf_page_to_image(path, 1);
             self.file_kind = FileKind::Pdf {
-                page_estimate: pages,
+                current_page: 1,
+                total_pages,
+                page_image,
             };
             return;
         }
@@ -400,11 +418,29 @@ impl eframe::App for QuickLookApp {
                         *current_slide += 1;
                     }
                 }
+                if let FileKind::Pdf { current_page, total_pages, page_image } = &mut self.file_kind {
+                    if *current_page < *total_pages {
+                        *current_page += 1;
+                        if let Some(ref path) = self.current_path {
+                            *page_image = render_pdf_page_to_image(path, *current_page);
+                            self.active_texture = None;
+                        }
+                    }
+                }
             }
             if i.key_pressed(egui::Key::PageUp) {
                 if let FileKind::Presentation { current_slide, .. } = &mut self.file_kind {
                     if *current_slide > 0 {
                         *current_slide -= 1;
+                    }
+                }
+                if let FileKind::Pdf { current_page, page_image, .. } = &mut self.file_kind {
+                    if *current_page > 1 {
+                        *current_page -= 1;
+                        if let Some(ref path) = self.current_path {
+                            *page_image = render_pdf_page_to_image(path, *current_page);
+                            self.active_texture = None;
+                        }
                     }
                 }
             }
@@ -506,14 +542,10 @@ impl eframe::App for QuickLookApp {
                         FileKind::Archive { total_entries, .. } => {
                             format!("·  ZIP · {total_entries} files")
                         }
-                        FileKind::Pdf { page_estimate } => {
-                            if let Some(p) = page_estimate {
-                                format!("·  PDF · ~{p} pages")
-                            } else {
-                                "·  PDF Document".into()
-                            }
+                        FileKind::Pdf { current_page, total_pages, .. } => {
+                            format!("·  PDF · Page {current_page}/{total_pages}")
                         }
-                        FileKind::Media { kind } => format!("·  {kind} Media"),
+                        FileKind::Media { kind, .. } => format!("·  {kind} Media"),
                         FileKind::Hex { total_size, .. } => {
                             format!("·  Binary · {}", format_bytes(*total_size))
                         }
@@ -597,13 +629,42 @@ impl eframe::App for QuickLookApp {
             FileKind::Archive { entries, .. } => {
                 render_archive_viewer(ui, entries, &mut self.search_filter);
             }
-            FileKind::Pdf { page_estimate } => {
+            FileKind::Pdf { current_page, total_pages, page_image } => {
+                if self.active_texture.is_none() {
+                    if let Some(img) = page_image.take() {
+                        self.active_texture = Some(ctx.load_texture("pdf_page", img, egui::TextureOptions::LINEAR));
+                    }
+                }
                 let p = self.current_path.as_deref().unwrap_or(Path::new("document.pdf"));
-                render_pdf_viewer(ui, p, *page_estimate);
+                if let Some(new_page) = render_pdf_viewer(
+                    ui,
+                    p,
+                    current_page,
+                    *total_pages,
+                    self.active_texture.as_ref(),
+                    &mut self.zoom_scale,
+                    &mut self.pan_offset,
+                ) {
+                    *page_image = render_pdf_page_to_image(p, new_page);
+                    self.active_texture = None;
+                }
             }
-            FileKind::Media { kind } => {
+            FileKind::Media { kind, poster_image } => {
+                if self.active_texture.is_none() {
+                    if let Some(img) = poster_image.take() {
+                        self.active_texture = Some(ctx.load_texture("media_poster", img, egui::TextureOptions::LINEAR));
+                    }
+                }
                 let p = self.current_path.as_deref().unwrap_or(Path::new("media"));
-                render_media_viewer(ui, p, kind, self.file_size);
+                render_media_viewer(
+                    ui,
+                    p,
+                    kind,
+                    self.file_size,
+                    self.active_texture.as_ref(),
+                    &mut self.zoom_scale,
+                    &mut self.pan_offset,
+                );
             }
             FileKind::Hex { data, total_size } => {
                 render_hex_viewer(ui, data, *total_size);
@@ -1073,79 +1134,220 @@ fn render_archive_viewer(
         });
 }
 
-fn render_pdf_viewer(ui: &mut egui::Ui, path: &Path, pages: Option<usize>) {
-    ui.centered_and_justified(|ui| {
-        ui.vertical_centered(|ui| {
-            ui.label(egui::RichText::new("📄").size(72.0));
-            ui.add_space(16.0);
-            ui.heading(
-                egui::RichText::new(
-                    path.file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("document.pdf"),
-                )
-                .size(22.0)
-                .color(egui::Color32::WHITE),
-            );
+fn render_pdf_viewer(
+    ui: &mut egui::Ui,
+    path: &Path,
+    current_page: &mut usize,
+    total_pages: usize,
+    texture: Option<&egui::TextureHandle>,
+    zoom_scale: &mut f32,
+    pan_offset: &mut egui::Vec2,
+) -> Option<usize> {
+    let mut page_change = None;
 
-            if let Some(p) = pages {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+
+        if ui.button("◀ Prev Page").on_hover_text("PageUp / [").clicked() && *current_page > 1 {
+            *current_page -= 1;
+            page_change = Some(*current_page);
+        }
+
+        ui.label(
+            egui::RichText::new(format!("Page {} of {}", *current_page, total_pages))
+                .strong()
+                .color(egui::Color32::WHITE),
+        );
+
+        if ui.button("Next Page ▶").on_hover_text("PageDown / ]").clicked() && *current_page < total_pages {
+            *current_page += 1;
+            page_change = Some(*current_page);
+        }
+
+        ui.separator();
+
+        if ui.button("100%").clicked() {
+            *zoom_scale = 1.0;
+            *pan_offset = egui::Vec2::ZERO;
+        }
+        if ui.button("+").clicked() {
+            *zoom_scale = (*zoom_scale * 1.2).min(10.0);
+        }
+        if ui.button("-").clicked() {
+            *zoom_scale = (*zoom_scale / 1.2).max(0.1);
+        }
+    });
+    ui.separator();
+
+    if let Some(tex) = texture {
+        render_texture_interactive(ui, tex, zoom_scale, pan_offset);
+    } else {
+        ui.centered_and_justified(|ui| {
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new("📄").size(72.0));
+                ui.add_space(16.0);
+                ui.heading(
+                    egui::RichText::new(
+                        path.file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("document.pdf"),
+                    )
+                    .size(22.0)
+                    .color(egui::Color32::WHITE),
+                );
+
                 ui.label(
-                    egui::RichText::new(format!("PDF Document · ~{p} pages"))
+                    egui::RichText::new(format!("PDF Document · {total_pages} pages"))
                         .color(egui::Color32::from_rgb(180, 180, 185)),
                 );
-            } else {
-                ui.label("Portable Document Format");
-            }
 
-            ui.add_space(24.0);
-            if ui
-                .button(
-                    egui::RichText::new("Open in Default PDF Viewer")
-                        .size(15.0)
-                        .color(egui::Color32::WHITE),
-                )
-                .clicked()
-            {
-                let _ = open::that(path);
-            }
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new("💡 To enable in-window page rendering, install poppler-utils:")
+                        .color(egui::Color32::from_rgb(140, 140, 150))
+                        .size(13.0),
+                );
+                ui.label(
+                    egui::RichText::new("sudo apt install poppler-utils  (or pacman -S poppler)")
+                        .monospace()
+                        .color(egui::Color32::from_rgb(180, 180, 220)),
+                );
+
+                ui.add_space(20.0);
+                if ui
+                    .button(
+                        egui::RichText::new("Open in Default PDF Viewer")
+                            .size(15.0)
+                            .color(egui::Color32::WHITE),
+                    )
+                    .clicked()
+                {
+                    let _ = open::that(path);
+                }
+            });
         });
-    });
+    }
+
+    page_change
 }
 
-fn render_media_viewer(ui: &mut egui::Ui, path: &Path, kind: &str, size: u64) {
-    ui.centered_and_justified(|ui| {
-        ui.vertical_centered(|ui| {
-            let icon = if kind == "Audio" { "🎵" } else { "🎬" };
-            ui.label(egui::RichText::new(icon).size(72.0));
-            ui.add_space(16.0);
-            ui.heading(
-                egui::RichText::new(
-                    path.file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("media"),
-                )
-                .size(22.0)
-                .color(egui::Color32::WHITE),
-            );
-
-            ui.label(
-                egui::RichText::new(format!("{kind} Media File · {}", format_bytes(size)))
-                    .color(egui::Color32::from_rgb(180, 180, 185)),
-            );
-
-            ui.add_space(24.0);
-            if ui
-                .button(
-                    egui::RichText::new("Play in Default Player")
-                        .size(15.0)
-                        .color(egui::Color32::WHITE),
-                )
-                .clicked()
-            {
-                let _ = open::that(path);
-            }
+fn render_media_viewer(
+    ui: &mut egui::Ui,
+    path: &Path,
+    kind: &str,
+    size: u64,
+    texture: Option<&egui::TextureHandle>,
+    zoom_scale: &mut f32,
+    pan_offset: &mut egui::Vec2,
+) {
+    if let Some(tex) = texture {
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("{kind} Preview · {}", format_bytes(size)))
+                        .color(egui::Color32::from_rgb(142, 142, 147))
+                        .size(12.0),
+                );
+                ui.separator();
+                if ui
+                    .button(
+                        egui::RichText::new("▶ Play in Player")
+                            .color(egui::Color32::from_rgb(120, 220, 120)),
+                    )
+                    .on_hover_text("Open in system player (Enter / o)")
+                    .clicked()
+                {
+                    let _ = open::that(path);
+                }
+            });
+            ui.separator();
+            render_texture_interactive(ui, tex, zoom_scale, pan_offset);
         });
-    });
+    } else {
+        ui.centered_and_justified(|ui| {
+            ui.vertical_centered(|ui| {
+                let icon = if kind == "Audio" { "🎵" } else { "🎬" };
+                ui.label(egui::RichText::new(icon).size(72.0));
+                ui.add_space(16.0);
+                ui.heading(
+                    egui::RichText::new(
+                        path.file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("media"),
+                    )
+                    .size(22.0)
+                    .color(egui::Color32::WHITE),
+                );
+
+                ui.label(
+                    egui::RichText::new(format!("{kind} Media File · {}", format_bytes(size)))
+                        .color(egui::Color32::from_rgb(180, 180, 185)),
+                );
+
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new("💡 To enable in-window video frame preview, install ffmpeg:")
+                        .color(egui::Color32::from_rgb(140, 140, 150))
+                        .size(13.0),
+                );
+                ui.label(
+                    egui::RichText::new("sudo apt install ffmpeg  (or pacman -S ffmpeg)")
+                        .monospace()
+                        .color(egui::Color32::from_rgb(180, 180, 220)),
+                );
+
+                ui.add_space(20.0);
+                if ui
+                    .button(
+                        egui::RichText::new("▶ Play in Default Player")
+                            .size(15.0)
+                            .color(egui::Color32::WHITE),
+                    )
+                    .clicked()
+                {
+                    let _ = open::that(path);
+                }
+            });
+        });
+    }
+}
+
+fn render_texture_interactive(
+    ui: &mut egui::Ui,
+    texture: &egui::TextureHandle,
+    zoom_scale: &mut f32,
+    pan_offset: &mut egui::Vec2,
+) {
+    let available_size = ui.available_size();
+    let (response, painter) = ui.allocate_painter(available_size, egui::Sense::drag());
+
+    if response.dragged() {
+        *pan_offset += response.drag_delta();
+    }
+
+    let scroll_delta = ui.input(|i| i.raw_scroll_delta.y);
+    if scroll_delta != 0.0 {
+        let factor = if scroll_delta > 0.0 { 1.1 } else { 0.9 };
+        *zoom_scale = (*zoom_scale * factor).clamp(0.05, 15.0);
+    }
+
+    let center = response.rect.center() + *pan_offset;
+    let target_size = available_size * (*zoom_scale);
+
+    let image = egui::Image::new(texture)
+        .fit_to_exact_size(target_size)
+        .shrink_to_fit();
+
+    let image_rect = egui::Rect::from_center_size(center, target_size);
+    image.paint_at(ui, image_rect);
+
+    painter.text(
+        response.rect.right_bottom() - egui::vec2(16.0, 16.0),
+        egui::Align2::RIGHT_BOTTOM,
+        format!("{:.0}%  (Drag to pan · Scroll to zoom)", *zoom_scale * 100.0),
+        egui::FontId::proportional(11.0),
+        egui::Color32::from_rgb(100, 100, 105),
+    );
 }
 
 fn render_hex_viewer(ui: &mut egui::Ui, data: &[u8], total_size: u64) {
@@ -1870,6 +2072,219 @@ fn detect_active_selection() -> Option<PathBuf> {
                         return Some(p);
                     }
                 }
+            }
+        }
+    }
+
+    None
+}
+
+fn load_color_image_from_bytes(bytes: &[u8]) -> Option<egui::ColorImage> {
+    let dyn_img = image::load_from_memory(bytes).ok()?;
+    let size = [dyn_img.width() as _, dyn_img.height() as _];
+    let image_buffer = dyn_img.to_rgba8();
+    let pixels = image_buffer.into_raw();
+    Some(egui::ColorImage::from_rgba_unmultiplied(size, &pixels))
+}
+
+fn pdf_get_total_pages(path: &Path) -> usize {
+    if let Some(path_str) = path.to_str() {
+        if let Ok(output) = std::process::Command::new("pdfinfo")
+            .arg(path_str)
+            .output()
+        {
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout);
+                for line in text.lines() {
+                    if let Some(rest) = line.strip_prefix("Pages:") {
+                        if let Ok(count) = rest.trim().parse::<usize>() {
+                            return count;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    estimate_pdf_pages(path).unwrap_or(1)
+}
+
+fn render_pdf_page_to_image(path: &Path, page: usize) -> Option<egui::ColorImage> {
+    let path_str = path.to_str()?;
+
+    // 1. pdftoppm (poppler-utils) - fast and high quality
+    if let Ok(output) = std::process::Command::new("pdftoppm")
+        .args(["-png", "-r", "150", "-f", &page.to_string(), "-l", &page.to_string(), path_str, "-"])
+        .output()
+    {
+        if output.status.success() && !output.stdout.is_empty() {
+            if let Some(img) = load_color_image_from_bytes(&output.stdout) {
+                return Some(img);
+            }
+        }
+    }
+
+    // 2. Ghostscript (gs) - default on almost all Linux distributions
+    if let Ok(output) = std::process::Command::new("gs")
+        .args([
+            "-sDEVICE=png16m",
+            &format!("-dFirstPage={page}"),
+            &format!("-dLastPage={page}"),
+            "-r150",
+            "-sOutputFile=-",
+            "-q",
+            "-dNOPAUSE",
+            "-dBATCH",
+            path_str,
+        ])
+        .output()
+    {
+        if output.status.success() && !output.stdout.is_empty() {
+            if let Some(img) = load_color_image_from_bytes(&output.stdout) {
+                return Some(img);
+            }
+        }
+    }
+
+    // 3. mutool (MuPDF)
+    if let Ok(output) = std::process::Command::new("mutool")
+        .args(["draw", "-o", "-", "-r", "150", path_str, &page.to_string()])
+        .output()
+    {
+        if output.status.success() && !output.stdout.is_empty() {
+            if let Some(img) = load_color_image_from_bytes(&output.stdout) {
+                return Some(img);
+            }
+        }
+    }
+
+    // 4. Fallback for page 1: FreeDesktop / KDE thumbnail cache
+    if page == 1 {
+        if let Some(img) = get_xdg_thumbnail(path) {
+            return Some(img);
+        }
+    }
+
+    None
+}
+
+fn extract_video_frame_to_image(path: &Path) -> Option<egui::ColorImage> {
+    let path_str = path.to_str()?;
+
+    // 1. ffmpeg
+    if let Ok(output) = std::process::Command::new("ffmpeg")
+        .args([
+            "-ss", "00:00:01",
+            "-i", path_str,
+            "-frames:v", "1",
+            "-f", "image2pipe",
+            "-vcodec", "png",
+            "-"
+        ])
+        .output()
+    {
+        if output.status.success() && !output.stdout.is_empty() {
+            if let Some(img) = load_color_image_from_bytes(&output.stdout) {
+                return Some(img);
+            }
+        }
+    }
+
+    // 2. ffmpegthumbnailer
+    if let Ok(output) = std::process::Command::new("ffmpegthumbnailer")
+        .args(["-i", path_str, "-o", "-", "-s", "1280", "-c", "png"])
+        .output()
+    {
+        if output.status.success() && !output.stdout.is_empty() {
+            if let Some(img) = load_color_image_from_bytes(&output.stdout) {
+                return Some(img);
+            }
+        }
+    }
+
+    // 3. mpv video frame capture
+    if let Ok(output) = std::process::Command::new("mpv")
+        .args([
+            "--no-audio",
+            "--start=1",
+            "--frames=1",
+            "--vo=image",
+            "--vo-image-format=png",
+            "--vo-image-outdir=/dev/stdout",
+            path_str,
+        ])
+        .output()
+    {
+        if output.status.success() && !output.stdout.is_empty() {
+            if let Some(img) = load_color_image_from_bytes(&output.stdout) {
+                return Some(img);
+            }
+        }
+    }
+
+    // 4. FreeDesktop / KDE Dolphin thumbnail cache
+    if let Some(img) = get_xdg_thumbnail(path) {
+        return Some(img);
+    }
+
+    None
+}
+
+fn extract_audio_art_to_image(path: &Path) -> Option<egui::ColorImage> {
+    let path_str = path.to_str()?;
+    if let Ok(output) = std::process::Command::new("ffmpeg")
+        .args(["-i", path_str, "-an", "-vcodec", "png", "-f", "image2pipe", "-"])
+        .output()
+    {
+        if output.status.success() && !output.stdout.is_empty() {
+            if let Some(img) = load_color_image_from_bytes(&output.stdout) {
+                return Some(img);
+            }
+        }
+    }
+
+    // Fallback: FreeDesktop / KDE Dolphin thumbnail cache
+    if let Some(img) = get_xdg_thumbnail(path) {
+        return Some(img);
+    }
+
+    None
+}
+
+fn get_xdg_thumbnail(path: &Path) -> Option<egui::ColorImage> {
+    let abs_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let uri = format!("file://{}", abs_path.to_string_lossy());
+
+    // Compute MD5 hash of file:// URI via md5sum or md5
+    let mut cmd = std::process::Command::new("md5sum");
+    let hash = if let Ok(mut child) = cmd
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+    {
+        use std::io::Write;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(uri.as_bytes());
+        }
+        child.wait_with_output().ok().and_then(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .split_whitespace()
+                .next()
+                .map(|s| s.to_string())
+        })
+    } else if let Ok(out) = std::process::Command::new("md5").arg("-s").arg(&uri).output() {
+        let s = String::from_utf8_lossy(&out.stdout);
+        s.split_whitespace().last().map(|s| s.to_string())
+    } else {
+        None
+    }?;
+
+    let home = std::env::var("HOME").ok()?;
+    let dirs = ["xx-large", "x-large", "large", "normal"];
+    for d in &dirs {
+        let candidate = format!("{home}/.cache/thumbnails/{d}/{hash}.png");
+        if let Ok(bytes) = fs::read(&candidate) {
+            if let Some(img) = load_color_image_from_bytes(&bytes) {
+                return Some(img);
             }
         }
     }
