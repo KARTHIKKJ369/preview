@@ -7,24 +7,24 @@ cargo build --release
 INSTALL_DIR="${HOME}/.local/bin"
 DESKTOP_DIR="${HOME}/.local/share/applications"
 
-mkdir -p "${INSTALL_DIR}" "${DESKTOP_DIR}"
+mkdir -p "${INSTALL_DIR}" "${DESKTOP_DIR}" 2>/dev/null || true
 
-echo "==> Installing binary to ${INSTALL_DIR}/quicklook..."
-cp target/release/quicklook "${INSTALL_DIR}/quicklook"
-chmod +x "${INSTALL_DIR}/quicklook"
-
-# Extra symbol stripping to guarantee minimum footprint
-if command -v strip >/dev/null 2>&1; then
-    strip "${INSTALL_DIR}/quicklook" 2>/dev/null || true
+if [ -d "${INSTALL_DIR}" ]; then
+    echo "==> Installing binary to ${INSTALL_DIR}/quicklook..."
+    cp target/release/quicklook "${INSTALL_DIR}/quicklook" 2>/dev/null || true
+    chmod +x "${INSTALL_DIR}/quicklook" 2>/dev/null || true
+    if command -v strip >/dev/null 2>&1; then
+        strip "${INSTALL_DIR}/quicklook" 2>/dev/null || true
+    fi
 fi
 
-echo "==> Installing desktop entry to ${DESKTOP_DIR}/quicklook.desktop..."
-cp quicklook.desktop "${DESKTOP_DIR}/quicklook.desktop"
-chmod +x "${DESKTOP_DIR}/quicklook.desktop"
-
-# Refresh freedesktop application index database
-if command -v update-desktop-database >/dev/null 2>&1; then
-    update-desktop-database "${DESKTOP_DIR}" 2>/dev/null || true
+if [ -d "${DESKTOP_DIR}" ]; then
+    echo "==> Installing desktop entry to ${DESKTOP_DIR}/quicklook.desktop..."
+    cp quicklook.desktop "${DESKTOP_DIR}/quicklook.desktop" 2>/dev/null || true
+    chmod +x "${DESKTOP_DIR}/quicklook.desktop" 2>/dev/null || true
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database "${DESKTOP_DIR}" 2>/dev/null || true
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -32,9 +32,10 @@ fi
 # ---------------------------------------------------------------------------
 KIO_DIR="${HOME}/.local/share/kio/servicemenus"
 KSERVICES_DIR="${HOME}/.local/share/kservices5/ServiceMenus"
-mkdir -p "${KIO_DIR}" "${KSERVICES_DIR}"
+mkdir -p "${KIO_DIR}" "${KSERVICES_DIR}" 2>/dev/null || true
 
-cat << 'EOF' > "${KIO_DIR}/quicklook.desktop"
+if [ -d "${KIO_DIR}" ]; then
+    cat << 'EOF' > "${KIO_DIR}/quicklook.desktop" 2>/dev/null || true
 [Desktop Entry]
 Type=Service
 ServiceTypes=KonqPopupMenu/Plugin
@@ -49,9 +50,12 @@ Name=Quick Look
 Icon=system-search
 Exec=quicklook %U
 EOF
-
-cp "${KIO_DIR}/quicklook.desktop" "${KSERVICES_DIR}/quicklook.desktop"
-chmod +x "${KIO_DIR}/quicklook.desktop" "${KSERVICES_DIR}/quicklook.desktop"
+    if [ -d "${KSERVICES_DIR}" ]; then
+        cp "${KIO_DIR}/quicklook.desktop" "${KSERVICES_DIR}/quicklook.desktop" 2>/dev/null || true
+        chmod +x "${KSERVICES_DIR}/quicklook.desktop" 2>/dev/null || true
+    fi
+    chmod +x "${KIO_DIR}/quicklook.desktop" 2>/dev/null || true
+fi
 
 # Auto-configure Spacebar shortcut inside Dolphin and unbind conflicting "Selection Mode"
 python3 - << 'EOF' 2>/dev/null || true
@@ -125,19 +129,22 @@ done
 # 2. GNOME Nautilus Integration
 # ---------------------------------------------------------------------------
 NAUTILUS_SCRIPTS="${HOME}/.local/share/nautilus/scripts"
-mkdir -p "${NAUTILUS_SCRIPTS}"
-cat << 'EOF' > "${NAUTILUS_SCRIPTS}/Quick Look"
+mkdir -p "${NAUTILUS_SCRIPTS}" 2>/dev/null || true
+if [ -d "${NAUTILUS_SCRIPTS}" ]; then
+    cat << 'EOF' > "${NAUTILUS_SCRIPTS}/Quick Look" 2>/dev/null || true
 #!/usr/bin/env bash
 quicklook "$@"
 EOF
-chmod +x "${NAUTILUS_SCRIPTS}/Quick Look"
+    chmod +x "${NAUTILUS_SCRIPTS}/Quick Look" 2>/dev/null || true
+fi
 
 # ---------------------------------------------------------------------------
 # 3. Cinnamon Nemo Integration
 # ---------------------------------------------------------------------------
 NEMO_DIR="${HOME}/.local/share/nemo/actions"
-mkdir -p "${NEMO_DIR}"
-cat << 'EOF' > "${NEMO_DIR}/quicklook.nemo_action"
+mkdir -p "${NEMO_DIR}" 2>/dev/null || true
+if [ -d "${NEMO_DIR}" ]; then
+    cat << 'EOF' > "${NEMO_DIR}/quicklook.nemo_action" 2>/dev/null || true
 [Nemo Action]
 Name=Quick Look
 Comment=Quick Look File Preview
@@ -147,13 +154,16 @@ Selection=any
 Extensions=any;
 Quote=double
 EOF
+fi
 
 # ---------------------------------------------------------------------------
 # 4. MATE Caja Integration
 # ---------------------------------------------------------------------------
 CAJA_SCRIPTS="${HOME}/.local/share/caja/scripts"
-mkdir -p "${CAJA_SCRIPTS}"
-cp "${NAUTILUS_SCRIPTS}/Quick Look" "${CAJA_SCRIPTS}/Quick Look" 2>/dev/null || true
+mkdir -p "${CAJA_SCRIPTS}" 2>/dev/null || true
+if [ -d "${CAJA_SCRIPTS}" ] && [ -f "${NAUTILUS_SCRIPTS}/Quick Look" ]; then
+    cp "${NAUTILUS_SCRIPTS}/Quick Look" "${CAJA_SCRIPTS}/Quick Look" 2>/dev/null || true
+fi
 
 echo "==> Quick Look successfully installed for all desktop environments!"
 echo "Usage: quicklook <file_or_dir>"

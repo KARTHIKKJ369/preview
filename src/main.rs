@@ -127,8 +127,18 @@ pub enum FileKind {
 
 #[derive(Debug, Clone)]
 pub struct SlideInfo {
+    pub slide_number: usize,
     pub title: String,
     pub bullets: Vec<String>,
+    pub is_title_slide: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AudioMetadata {
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub duration: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +166,7 @@ pub struct QuickLookApp {
     pan_offset: egui::Vec2,
     search_filter: String,
     media_player: Option<MediaPlayer>,
+    pending_resize: Option<egui::Vec2>,
 }
 
 impl QuickLookApp {
@@ -171,12 +182,83 @@ impl QuickLookApp {
             pan_offset: egui::Vec2::ZERO,
             search_filter: String::new(),
             media_player: None,
+            pending_resize: None,
         };
 
         if let Some(t) = target {
             app.set_target(t);
         }
         app
+    }
+
+    pub fn calculate_optimal_size(&self) -> egui::Vec2 {
+        match &self.file_kind {
+            FileKind::Image { width, height, .. } => {
+                if *width > 0 && *height > 0 {
+                    let max_w = 1100.0_f32;
+                    let max_h = 820.0_f32;
+                    let min_w = 460.0_f32;
+                    let min_h = 360.0_f32;
+                    let top_bar_h = 48.0_f32;
+
+                    let aspect = *width as f32 / *height as f32;
+
+                    let mut target_h = (max_h - top_bar_h).min(*height as f32);
+                    let mut target_w = target_h * aspect;
+
+                    if target_w > max_w {
+                        target_w = max_w;
+                        target_h = target_w / aspect;
+                    }
+
+                    egui::vec2(
+                        target_w.clamp(min_w, max_w),
+                        (target_h + top_bar_h).clamp(min_h, max_h),
+                    )
+                } else {
+                    egui::vec2(800.0, 600.0)
+                }
+            }
+            FileKind::Media { kind, .. } => {
+                if *kind == "Audio" {
+                    egui::vec2(580.0, 440.0)
+                } else {
+                    if let Some(player) = &self.media_player {
+                        if player.dimensions.0 > 0 && player.dimensions.1 > 0 {
+                            let aspect = player.dimensions.0 as f32 / player.dimensions.1 as f32;
+                            let target_w = 960.0_f32;
+                            let target_h = (target_w / aspect) + 48.0;
+                            return egui::vec2(target_w, target_h.clamp(400.0, 800.0));
+                        }
+                    }
+                    egui::vec2(960.0, 580.0)
+                }
+            }
+            FileKind::Pdf { .. } => {
+                egui::vec2(1020.0, 880.0)
+            }
+            FileKind::Presentation { .. } => {
+                egui::vec2(1140.0, 680.0)
+            }
+            FileKind::Spreadsheet { .. } => {
+                egui::vec2(1040.0, 660.0)
+            }
+            FileKind::Document { .. } => {
+                egui::vec2(960.0, 800.0)
+            }
+            FileKind::Code { .. } | FileKind::Markdown { .. } => {
+                egui::vec2(920.0, 720.0)
+            }
+            FileKind::Directory { .. } | FileKind::Archive { .. } => {
+                egui::vec2(860.0, 620.0)
+            }
+            _ => egui::vec2(880.0, 640.0),
+        }
+    }
+
+    fn set_loaded_kind(&mut self, kind: FileKind) {
+        self.file_kind = kind;
+        self.pending_resize = Some(self.calculate_optimal_size());
     }
 
     fn set_target(&mut self, target: PathBuf) {
@@ -216,7 +298,7 @@ impl QuickLookApp {
         let path = match self.current_path.as_deref() {
             Some(p) => p,
             None => {
-                self.file_kind = FileKind::Welcome;
+                self.set_loaded_kind(FileKind::Welcome);
                 return;
             }
         };
@@ -225,7 +307,7 @@ impl QuickLookApp {
             Ok(m) => m,
             Err(e) => {
                 self.file_size = 0;
-                self.file_kind = FileKind::Error(format!("Failed to read metadata: {e}"));
+                self.set_loaded_kind(FileKind::Error(format!("Failed to read metadata: {e}")));
                 return;
             }
         };
@@ -233,7 +315,8 @@ impl QuickLookApp {
         self.file_size = metadata.len();
 
         if metadata.is_dir() {
-            self.file_kind = load_directory(path);
+            let kind = load_directory(path);
+            self.set_loaded_kind(kind);
             return;
         }
 
@@ -248,11 +331,11 @@ impl QuickLookApp {
             "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "svg" | "tiff" | "tif" => {
                 let (width, height) = image::image_dimensions(path).unwrap_or((0, 0));
                 let uri = format!("file://{}", path.to_string_lossy());
-                self.file_kind = FileKind::Image {
+                self.set_loaded_kind(FileKind::Image {
                     width,
                     height,
                     uri,
-                };
+                });
                 return;
             }
             _ => {}
@@ -260,49 +343,58 @@ impl QuickLookApp {
 
         // 2. Presentations (PowerPoint PPTX, ODP, PPT)
         if ext == "pptx" || ext == "odp" {
-            self.file_kind = load_pptx(path);
+            let kind = load_pptx(path);
+            self.set_loaded_kind(kind);
             return;
         }
         if ext == "ppt" {
-            self.file_kind = load_legacy_office(path, "PowerPoint Presentation");
+            let kind = load_legacy_office(path, "PowerPoint Presentation");
+            self.set_loaded_kind(kind);
             return;
         }
 
         // 3. Spreadsheets (Excel XLSX, ODS, XLS, CSV, TSV)
         if ext == "xlsx" || ext == "ods" {
-            self.file_kind = load_xlsx(path);
+            let kind = load_xlsx(path);
+            self.set_loaded_kind(kind);
             return;
         }
         if ext == "xls" {
-            self.file_kind = load_legacy_office(path, "Excel Spreadsheet");
+            let kind = load_legacy_office(path, "Excel Spreadsheet");
+            self.set_loaded_kind(kind);
             return;
         }
         if ext == "csv" {
             if let Ok(content) = fs::read_to_string(path) {
-                self.file_kind = load_csv_or_tsv(&content, ',');
+                let kind = load_csv_or_tsv(&content, ',');
+                self.set_loaded_kind(kind);
                 return;
             }
         }
         if ext == "tsv" {
             if let Ok(content) = fs::read_to_string(path) {
-                self.file_kind = load_csv_or_tsv(&content, '\t');
+                let kind = load_csv_or_tsv(&content, '\t');
+                self.set_loaded_kind(kind);
                 return;
             }
         }
 
         // 4. Word Documents (DOCX, ODT, DOC, RTF)
         if ext == "docx" || ext == "odt" {
-            self.file_kind = load_docx(path);
+            let kind = load_docx(path);
+            self.set_loaded_kind(kind);
             return;
         }
         if ext == "doc" || ext == "rtf" {
-            self.file_kind = load_legacy_office(path, "Word Document");
+            let kind = load_legacy_office(path, "Word Document");
+            self.set_loaded_kind(kind);
             return;
         }
 
         // 5. Archives (ZIP detection)
         if ext == "zip" || ext == "jar" || ext == "war" {
-            self.file_kind = load_zip_listing(path, self.file_size);
+            let kind = load_zip_listing(path, self.file_size);
+            self.set_loaded_kind(kind);
             return;
         }
 
@@ -310,22 +402,22 @@ impl QuickLookApp {
         match ext.as_str() {
             "mp3" | "wav" | "ogg" | "flac" | "aac" | "m4a" | "opus" => {
                 let poster_image = extract_audio_art_to_image(path);
-                let (duration, dims) = probe_media_info(path);
-                self.media_player = Some(MediaPlayer::new(path, false, duration, dims));
-                self.file_kind = FileKind::Media {
+                let (duration, dims, audio_meta) = probe_media_info(path);
+                self.media_player = Some(MediaPlayer::new(path, false, duration, dims, audio_meta));
+                self.set_loaded_kind(FileKind::Media {
                     kind: "Audio",
                     poster_image,
-                };
+                });
                 return;
             }
             "mp4" | "mkv" | "mov" | "webm" | "avi" | "wmv" | "flv" => {
                 let poster_image = extract_video_frame_to_image(path);
-                let (duration, dims) = probe_media_info(path);
-                self.media_player = Some(MediaPlayer::new(path, true, duration, dims));
-                self.file_kind = FileKind::Media {
+                let (duration, dims, audio_meta) = probe_media_info(path);
+                self.media_player = Some(MediaPlayer::new(path, true, duration, dims, audio_meta));
+                self.set_loaded_kind(FileKind::Media {
                     kind: "Video",
                     poster_image,
-                };
+                });
                 return;
             }
             _ => {}
@@ -335,22 +427,23 @@ impl QuickLookApp {
         if ext == "pdf" {
             let total_pages = pdf_get_total_pages(path);
             let page_image = render_pdf_page_to_image(path, 1);
-            self.file_kind = FileKind::Pdf {
+            self.set_loaded_kind(FileKind::Pdf {
                 current_page: 1,
                 total_pages,
                 page_image,
-            };
+            });
             return;
         }
 
-        // 5. Code & Text (Streaming read up to 512 KB to avoid UI freezing)
+        // 8. Code & Text (Streaming read up to 512 KB to avoid UI freezing)
         const MAX_TEXT_BYTES: u64 = 512 * 1024;
         let read_limit = self.file_size.min(MAX_TEXT_BYTES) as usize;
         let mut buffer = vec![0u8; read_limit];
         let bytes_read = match File::open(path).and_then(|mut f| f.read(&mut buffer)) {
             Ok(n) => n,
             Err(e) => {
-                self.file_kind = FileKind::Error(format!("Read error: {e}"));
+                self.file_size = 0;
+                self.set_loaded_kind(FileKind::Error(format!("Read error: {e}")));
                 return;
             }
         };
@@ -360,25 +453,25 @@ impl QuickLookApp {
         if let Ok(text) = std::str::from_utf8(&buffer) {
             let lines = text.lines().count();
             if ext == "md" || ext == "markdown" {
-                self.file_kind = FileKind::Markdown {
+                self.set_loaded_kind(FileKind::Markdown {
                     content: text.to_string(),
                     lines,
-                };
+                });
                 return;
             }
 
             let lang = detect_language(&ext, text);
             let truncated = self.file_size > MAX_TEXT_BYTES;
-            self.file_kind = FileKind::Code {
+            self.set_loaded_kind(FileKind::Code {
                 content: text.to_string(),
                 language: lang,
                 lines,
                 truncated,
-            };
+            });
             return;
         }
 
-        // 6. Binary / Hex Fallback (Reads first 16KB for hex dump)
+        // 9. Binary / Hex Fallback (Reads first 16KB for hex dump)
         const MAX_HEX_BYTES: usize = 16 * 1024;
         let hex_slice = if buffer.len() > MAX_HEX_BYTES {
             buffer[..MAX_HEX_BYTES].to_vec()
@@ -386,15 +479,20 @@ impl QuickLookApp {
             buffer
         };
 
-        self.file_kind = FileKind::Hex {
+        self.set_loaded_kind(FileKind::Hex {
             data: hex_slice,
             total_size: self.file_size,
-        };
+        });
     }
 }
 
 impl eframe::App for QuickLookApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Dynamic window resizing based on content (macOS Quick Look behavior)
+        if let Some(target_size) = self.pending_resize.take() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target_size));
+        }
+
         // Drain incoming video frames and update media playback timer
         if let Some(player) = &mut self.media_player {
             if let Some(rx) = &player.frame_receiver {
@@ -629,8 +727,21 @@ impl eframe::App for QuickLookApp {
                             }
                         }
 
-                        // Image zoom controls
-                        if matches!(self.file_kind, FileKind::Image { .. }) {
+                        // Audio Volume Control in Top Bar (matching Screenshot 2)
+                        if matches!(self.file_kind, FileKind::Media { kind: "Audio", .. }) {
+                            if let Some(player) = &mut self.media_player {
+                                let vol_icon = if player.volume <= 0.01 { "🔇" } else { "🔊" };
+                                ui.label(vol_icon);
+                                ui.add_sized(
+                                    [68.0, 16.0],
+                                    egui::Slider::new(&mut player.volume, 0.0..=1.0).show_value(false),
+                                );
+                                ui.separator();
+                            }
+                        }
+
+                        // Zoom controls for Image & PDF
+                        if matches!(self.file_kind, FileKind::Image { .. }) || matches!(self.file_kind, FileKind::Pdf { .. }) {
                             if ui.button("100%").clicked() {
                                 self.zoom_scale = 1.0;
                                 self.pan_offset = egui::Vec2::ZERO;
@@ -699,21 +810,23 @@ impl eframe::App for QuickLookApp {
                 }
             }
             FileKind::Media { kind, poster_image } => {
+                if self.active_texture.is_none() {
+                    if let Some(img) = poster_image.take() {
+                        self.active_texture = Some(ctx.load_texture("media_poster", img, egui::TextureOptions::LINEAR));
+                    }
+                }
                 if let Some(player) = &mut self.media_player {
-                    render_media_player(
+                    if let Some(delta) = render_media_player(
                         ui,
                         player,
                         self.active_texture.as_ref(),
                         self.file_size,
                         &mut self.zoom_scale,
                         &mut self.pan_offset,
-                    );
-                } else {
-                    if self.active_texture.is_none() {
-                        if let Some(img) = poster_image.take() {
-                            self.active_texture = Some(ctx.load_texture("media_poster", img, egui::TextureOptions::LINEAR));
-                        }
+                    ) {
+                        self.navigate(delta);
                     }
+                } else {
                     let p = self.current_path.as_deref().unwrap_or(Path::new("media"));
                     render_media_viewer(
                         ui,
@@ -1024,55 +1137,163 @@ fn render_presentation_viewer(
         *current_slide = 0;
     }
 
+    let total_rect = ui.available_rect_before_wrap();
+    let sidebar_width = 138.0_f32;
+
     ui.horizontal(|ui| {
-        if ui.button("◀ Prev Slide").on_hover_text("PageUp").clicked() && *current_slide > 0 {
-            *current_slide -= 1;
+        // --- LEFT SIDEBAR: Slide Thumbnails (Screenshot 3) ---
+        egui::Frame::canvas(ui.style())
+            .fill(egui::Color32::from_rgb(20, 20, 22))
+            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(36, 36, 40)))
+            .inner_margin(egui::Margin::symmetric(8.0, 10.0))
+            .show(ui, |ui| {
+                ui.set_width(sidebar_width);
+                ui.set_height(total_rect.height());
+
+                egui::ScrollArea::vertical()
+                    .id_salt("pptx_slide_thumbs")
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 10.0;
+                        for (idx, slide) in slides.iter().enumerate() {
+                            let is_selected = idx == *current_slide;
+                            let card_size = egui::vec2(120.0, 68.0); // 16:9 ratio
+
+                            let (rect, response) = ui.allocate_exact_size(card_size, egui::Sense::click());
+                            if response.clicked() {
+                                *current_slide = idx;
+                            }
+
+                            let painter = ui.painter_at(rect);
+                            let border_stroke = if is_selected {
+                                egui::Stroke::new(2.5_f32, egui::Color32::from_rgb(0, 122, 255))
+                            } else if response.hovered() {
+                                egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(120, 120, 125))
+                            } else {
+                                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(55, 55, 60))
+                            };
+
+                            // Miniature white slide sheet
+                            painter.rect(
+                                rect,
+                                egui::Rounding::same(4.0),
+                                egui::Color32::WHITE,
+                                border_stroke,
+                            );
+
+                            // Slide text in thumbnail
+                            let mini_title = if slide.title.len() > 18 {
+                                format!("{}...", &slide.title[..18])
+                            } else {
+                                slide.title.clone()
+                            };
+
+                            painter.text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                mini_title,
+                                egui::FontId::proportional(8.5),
+                                egui::Color32::from_rgb(30, 30, 35),
+                            );
+
+                            // Miniature slide number label
+                            ui.vertical_centered(|ui| {
+                                ui.label(
+                                    egui::RichText::new(format!("Slide {}", idx + 1))
+                                        .size(10.5)
+                                        .color(if is_selected {
+                                            egui::Color32::from_rgb(0, 122, 255)
+                                        } else {
+                                            egui::Color32::from_rgb(140, 140, 145)
+                                        }),
+                                );
+                            });
+                        }
+                    });
+            });
+
+        ui.separator();
+
+        // --- MAIN VIEWPORT: 16:9 Presentation Canvas (Screenshot 3) ---
+        let main_avail = ui.available_size();
+        let target_aspect = 16.0 / 9.0;
+
+        let padding = 24.0;
+        let mut slide_w = main_avail.x - padding * 2.0;
+        let mut slide_h = slide_w / target_aspect;
+
+        if slide_h > (main_avail.y - padding * 2.0) {
+            slide_h = (main_avail.y - padding * 2.0).max(100.0);
+            slide_w = slide_h * target_aspect;
         }
-        ui.label(
-            egui::RichText::new(format!("Slide {} of {}", *current_slide + 1, slide_count))
-                .strong()
-                .color(egui::Color32::WHITE),
-        );
-        if ui.button("Next Slide ▶").on_hover_text("PageDown").clicked() && *current_slide + 1 < slide_count {
-            *current_slide += 1;
-        }
-    });
 
-    ui.separator();
+        let slide = &slides[*current_slide];
 
-    let slide = &slides[*current_slide];
-
-    egui::ScrollArea::vertical().show(ui, |ui| {
         ui.vertical_centered(|ui| {
-            ui.add_space(16.0);
+            let v_space = ((main_avail.y - slide_h) / 2.0).max(8.0);
+            ui.add_space(v_space);
+
             egui::Frame::canvas(ui.style())
-                .fill(egui::Color32::from_rgb(32, 34, 40))
-                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(60, 62, 70)))
-                .rounding(egui::Rounding::same(8.0))
-                .inner_margin(egui::Margin::same(32.0))
+                .fill(egui::Color32::WHITE)
+                .rounding(egui::Rounding::same(10.0))
+                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(215, 215, 220)))
+                .shadow(egui::epaint::Shadow {
+                    offset: egui::vec2(0.0, 4.0),
+                    blur: 12.0,
+                    spread: 2.0,
+                    color: egui::Color32::from_black_alpha(45),
+                })
+                .inner_margin(egui::Margin::same(44.0))
                 .show(ui, |ui| {
-                    ui.set_min_width(600.0);
-                    ui.set_min_height(340.0);
+                    ui.set_width(slide_w);
+                    ui.set_height(slide_h);
 
-                    ui.heading(
-                        egui::RichText::new(&slide.title)
-                            .size(24.0)
-                            .strong()
-                            .color(egui::Color32::WHITE),
-                    );
-                    ui.separator();
-                    ui.add_space(12.0);
-
-                    for bullet in &slide.bullets {
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("▸").color(egui::Color32::from_rgb(0, 122, 255)).size(15.0));
+                    if slide.is_title_slide || slide.bullets.is_empty() {
+                        // Title slide: vertically & horizontally centered (e.g. "NETWORK LAYER")
+                        ui.centered_and_justified(|ui| {
                             ui.label(
-                                egui::RichText::new(bullet)
-                                    .size(15.0)
-                                    .color(egui::Color32::from_rgb(220, 220, 225)),
+                                egui::RichText::new(&slide.title)
+                                    .size(36.0)
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(20, 20, 24)),
                             );
                         });
-                        ui.add_space(4.0);
+                    } else {
+                        // Content slide: Title at top + divider + bullets
+                        ui.label(
+                            egui::RichText::new(&slide.title)
+                                .size(26.0)
+                                .strong()
+                                .color(egui::Color32::from_rgb(20, 20, 24)),
+                        );
+
+                        ui.add_space(8.0);
+                        let line_rect = egui::Rect::from_min_size(
+                            ui.cursor().min,
+                            egui::vec2(ui.available_width(), 1.5),
+                        );
+                        ui.painter().rect_filled(
+                            line_rect,
+                            0.0,
+                            egui::Color32::from_rgb(225, 225, 230),
+                        );
+                        ui.add_space(18.0);
+
+                        for bullet in &slide.bullets {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("•")
+                                        .size(16.0)
+                                        .color(egui::Color32::from_rgb(0, 122, 255)),
+                                );
+                                ui.add_space(6.0);
+                                ui.label(
+                                    egui::RichText::new(bullet)
+                                        .size(16.0)
+                                        .color(egui::Color32::from_rgb(40, 40, 45)),
+                                );
+                            });
+                            ui.add_space(8.0);
+                        }
                     }
                 });
         });
@@ -1212,89 +1433,161 @@ fn render_pdf_viewer(
     pan_offset: &mut egui::Vec2,
 ) -> Option<usize> {
     let mut page_change = None;
+    let total_rect = ui.available_rect_before_wrap();
+    let sidebar_width = 118.0_f32;
 
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 8.0;
-
-        if ui.button("◀ Prev Page").on_hover_text("PageUp / [").clicked() && *current_page > 1 {
-            *current_page -= 1;
-            page_change = Some(*current_page);
-        }
-
-        ui.label(
-            egui::RichText::new(format!("Page {} of {}", *current_page, total_pages))
-                .strong()
-                .color(egui::Color32::WHITE),
+        // --- MAIN PDF VIEWPORT (Center/Left) ---
+        let main_width = (total_rect.width() - sidebar_width - 8.0).max(100.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(main_width, total_rect.height()),
+            egui::Layout::top_down(egui::Align::Center),
+            |ui| {
+                if let Some(tex) = texture {
+                    render_texture_interactive(ui, tex, zoom_scale, pan_offset);
+                } else {
+                    ui.centered_and_justified(|ui| {
+                        egui::Frame::canvas(ui.style())
+                            .fill(egui::Color32::WHITE)
+                            .rounding(egui::Rounding::same(8.0))
+                            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(220, 220, 225)))
+                            .shadow(egui::epaint::Shadow {
+                                offset: egui::vec2(0.0, 4.0),
+                                blur: 10.0,
+                                spread: 2.0,
+                                color: egui::Color32::from_black_alpha(40),
+                            })
+                            .inner_margin(egui::Margin::same(36.0))
+                            .show(ui, |ui| {
+                                ui.set_min_size(egui::vec2(520.0, 700.0));
+                                ui.vertical_centered(|ui| {
+                                    ui.add_space(40.0);
+                                    ui.label(egui::RichText::new("📄").size(64.0));
+                                    ui.add_space(16.0);
+                                    ui.heading(
+                                        egui::RichText::new(
+                                            path.file_name()
+                                                .and_then(|s| s.to_str())
+                                                .unwrap_or("document.pdf"),
+                                        )
+                                        .size(20.0)
+                                        .color(egui::Color32::from_rgb(20, 20, 24)),
+                                    );
+                                    ui.add_space(6.0);
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "PDF Document · Page {} of {}",
+                                            *current_page, total_pages
+                                        ))
+                                        .color(egui::Color32::from_rgb(100, 100, 105))
+                                        .size(13.0),
+                                    );
+                                    ui.add_space(16.0);
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "💡 To enable high-res page rendering, install poppler-utils:",
+                                        )
+                                        .color(egui::Color32::from_rgb(120, 120, 125))
+                                        .size(12.0),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "sudo apt install poppler-utils (or pacman -S poppler)",
+                                        )
+                                        .monospace()
+                                        .color(egui::Color32::from_rgb(0, 122, 255))
+                                        .size(12.0),
+                                    );
+                                    ui.add_space(20.0);
+                                    if ui.button("Open in Default PDF Viewer").clicked() {
+                                        let _ = open::that(path);
+                                    }
+                                });
+                            });
+                    });
+                }
+            },
         );
-
-        if ui.button("Next Page ▶").on_hover_text("PageDown / ]").clicked() && *current_page < total_pages {
-            *current_page += 1;
-            page_change = Some(*current_page);
-        }
 
         ui.separator();
 
-        if ui.button("100%").clicked() {
-            *zoom_scale = 1.0;
-            *pan_offset = egui::Vec2::ZERO;
-        }
-        if ui.button("+").clicked() {
-            *zoom_scale = (*zoom_scale * 1.2).min(10.0);
-        }
-        if ui.button("-").clicked() {
-            *zoom_scale = (*zoom_scale / 1.2).max(0.1);
-        }
-    });
-    ui.separator();
+        // --- RIGHT SIDEBAR: Page Thumbnails (Screenshot 1) ---
+        egui::Frame::canvas(ui.style())
+            .fill(egui::Color32::from_rgb(20, 20, 22))
+            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(36, 36, 40)))
+            .inner_margin(egui::Margin::symmetric(8.0, 10.0))
+            .show(ui, |ui| {
+                ui.set_width(sidebar_width);
+                ui.set_height(total_rect.height());
 
-    if let Some(tex) = texture {
-        render_texture_interactive(ui, tex, zoom_scale, pan_offset);
-    } else {
-        ui.centered_and_justified(|ui| {
-            ui.vertical_centered(|ui| {
-                ui.label(egui::RichText::new("📄").size(72.0));
-                ui.add_space(16.0);
-                ui.heading(
-                    egui::RichText::new(
-                        path.file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("document.pdf"),
-                    )
-                    .size(22.0)
-                    .color(egui::Color32::WHITE),
-                );
+                egui::ScrollArea::vertical()
+                    .id_salt("pdf_page_thumbs")
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 10.0;
+                        for page in 1..=total_pages {
+                            let is_selected = page == *current_page;
+                            let card_size = egui::vec2(86.0, 120.0); // Standard A4 ratio
 
-                ui.label(
-                    egui::RichText::new(format!("PDF Document · {total_pages} pages"))
-                        .color(egui::Color32::from_rgb(180, 180, 185)),
-                );
+                            let (rect, response) = ui.allocate_exact_size(card_size, egui::Sense::click());
+                            if response.clicked() && page != *current_page {
+                                *current_page = page;
+                                page_change = Some(page);
+                            }
 
-                ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new("💡 To enable in-window page rendering, install poppler-utils:")
-                        .color(egui::Color32::from_rgb(140, 140, 150))
-                        .size(13.0),
-                );
-                ui.label(
-                    egui::RichText::new("sudo apt install poppler-utils  (or pacman -S poppler)")
-                        .monospace()
-                        .color(egui::Color32::from_rgb(180, 180, 220)),
-                );
+                            let painter = ui.painter_at(rect);
+                            let border_stroke = if is_selected {
+                                egui::Stroke::new(2.5_f32, egui::Color32::from_rgb(0, 122, 255))
+                            } else if response.hovered() {
+                                egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(120, 120, 125))
+                            } else {
+                                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(55, 55, 60))
+                            };
 
-                ui.add_space(20.0);
-                if ui
-                    .button(
-                        egui::RichText::new("Open in Default PDF Viewer")
-                            .size(15.0)
-                            .color(egui::Color32::WHITE),
-                    )
-                    .clicked()
-                {
-                    let _ = open::that(path);
-                }
+                            // Miniature page sheet
+                            painter.rect(
+                                rect,
+                                egui::Rounding::same(3.0),
+                                egui::Color32::from_rgb(248, 248, 250),
+                                border_stroke,
+                            );
+
+                            // Subtle miniature text lines on thumbnail
+                            let line_color = egui::Color32::from_rgb(215, 215, 220);
+                            for li in 0..6 {
+                                let ly = rect.min.y + 16.0 + (li as f32 * 14.0);
+                                let lw = if li == 0 {
+                                    40.0
+                                } else if li == 5 {
+                                    30.0
+                                } else {
+                                    62.0
+                                };
+                                painter.rect_filled(
+                                    egui::Rect::from_min_size(
+                                        egui::pos2(rect.min.x + 12.0, ly),
+                                        egui::vec2(lw, 2.5),
+                                    ),
+                                    1.0,
+                                    line_color,
+                                );
+                            }
+
+                            // Page number label below
+                            ui.vertical_centered(|ui| {
+                                ui.label(
+                                    egui::RichText::new(format!("Page {}", page))
+                                        .size(10.5)
+                                        .color(if is_selected {
+                                            egui::Color32::from_rgb(0, 122, 255)
+                                        } else {
+                                            egui::Color32::from_rgb(140, 140, 145)
+                                        }),
+                                );
+                            });
+                        }
+                    });
             });
-        });
-    }
+    });
 
     page_change
 }
@@ -1307,6 +1600,7 @@ pub struct MediaPlayer {
     pub duration: f64,
     pub volume: f32,
     pub dimensions: (u32, u32),
+    pub audio_meta: Option<AudioMetadata>,
     pub frame_receiver: Option<Receiver<egui::ColorImage>>,
     pub stop_sender: Option<Sender<()>>,
     pub audio_child: Option<Child>,
@@ -1320,6 +1614,7 @@ impl MediaPlayer {
         is_video: bool,
         duration: f64,
         dimensions: (u32, u32),
+        audio_meta: Option<AudioMetadata>,
     ) -> Self {
         let mut player = Self {
             is_video,
@@ -1329,6 +1624,7 @@ impl MediaPlayer {
             duration: if duration > 0.0 { duration } else { 1.0 },
             volume: 1.0,
             dimensions,
+            audio_meta,
             frame_receiver: None,
             stop_sender: None,
             audio_child: None,
@@ -1407,146 +1703,276 @@ impl Drop for MediaPlayer {
     }
 }
 
-fn render_media_player(
+fn render_audio_player(
     ui: &mut egui::Ui,
     player: &mut MediaPlayer,
     texture: Option<&egui::TextureHandle>,
     _size: u64,
+) -> Option<isize> {
+    let mut toggle_play = false;
+    let mut seek_to = None;
+    let mut nav_delta = None;
+    let available_rect = ui.available_rect_before_wrap();
+
+    let meta = player.audio_meta.clone().unwrap_or_default();
+    let display_title = if !meta.title.is_empty() {
+        meta.title.clone()
+    } else {
+        player.path.file_stem().and_then(|s| s.to_str()).unwrap_or("Audio Track").to_string()
+    };
+
+    // 1. Central Card Area (Screenshot 2)
+    let body_height = (available_rect.height() - 56.0).max(120.0);
+    ui.allocate_ui_with_layout(
+        egui::vec2(available_rect.width(), body_height),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.add_space(32.0);
+
+            // Left: Album Art Card (Screenshot 2: 170x170 px)
+            let art_size = egui::vec2(170.0, 170.0);
+            let (rect, _) = ui.allocate_exact_size(art_size, egui::Sense::hover());
+            let painter = ui.painter_at(rect);
+
+            if let Some(tex) = texture {
+                let img = egui::Image::new(tex)
+                    .fit_to_exact_size(art_size)
+                    .rounding(egui::Rounding::same(12.0));
+                img.paint_at(ui, rect);
+            } else {
+                // macOS Style placeholder tile
+                painter.rect_filled(rect, 12.0, egui::Color32::from_rgb(236, 236, 240));
+                painter.rect_stroke(rect, 12.0, egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(215, 215, 220)));
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "🎵",
+                    egui::FontId::proportional(64.0),
+                    egui::Color32::from_rgb(175, 175, 180),
+                );
+            }
+
+            ui.add_space(26.0);
+
+            // Right: Track Metadata Stack (Screenshot 2)
+            ui.vertical(|ui| {
+                ui.add_space(16.0);
+
+                // Track Title (Large, Bold, White)
+                ui.label(
+                    egui::RichText::new(&display_title)
+                        .size(19.0)
+                        .strong()
+                        .color(egui::Color32::WHITE),
+                );
+
+                ui.add_space(10.0);
+
+                // Artist
+                let artist_text = if !meta.artist.is_empty() {
+                    format!("Artist: {}", meta.artist)
+                } else {
+                    "Artist: Unknown Artist".into()
+                };
+                ui.label(
+                    egui::RichText::new(artist_text)
+                        .size(13.5)
+                        .color(egui::Color32::from_rgb(165, 165, 170)),
+                );
+
+                ui.add_space(4.0);
+
+                // Album
+                let album_text = if !meta.album.is_empty() {
+                    format!("Album: {}", meta.album)
+                } else {
+                    format!("Album: {}", display_title)
+                };
+                ui.label(
+                    egui::RichText::new(album_text)
+                        .size(13.5)
+                        .color(egui::Color32::from_rgb(165, 165, 170)),
+                );
+
+                ui.add_space(4.0);
+
+                // Time
+                ui.label(
+                    egui::RichText::new(format!("Time: {}", format_time(player.duration)))
+                        .size(13.5)
+                        .color(egui::Color32::from_rgb(165, 165, 170)),
+                );
+            });
+        },
+    );
+
+    // 2. Bottom Transport Bar (Screenshot 2)
+    egui::Frame::canvas(ui.style())
+        .fill(egui::Color32::from_rgb(22, 22, 24))
+        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(38, 38, 42)))
+        .inner_margin(egui::Margin::symmetric(14.0, 8.0))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+
+                // ⏪ 15 (Rewind 15s)
+                if ui
+                    .button(egui::RichText::new("⟲15").size(13.0))
+                    .on_hover_text("Rewind 15 seconds")
+                    .clicked()
+                {
+                    seek_to = Some((player.current_time - 15.0).max(0.0));
+                }
+
+                // Play / Pause (⏸ / ▶)
+                let play_icon = if player.is_playing { "⏸" } else { "▶" };
+                if ui
+                    .button(egui::RichText::new(play_icon).size(16.0).strong())
+                    .on_hover_text("Play / Pause (Click or press P)")
+                    .clicked()
+                {
+                    toggle_play = true;
+                }
+
+                // 15 ⏩ (Forward 15s)
+                if ui
+                    .button(egui::RichText::new("15⟳").size(13.0))
+                    .on_hover_text("Forward 15 seconds")
+                    .clicked()
+                {
+                    seek_to = Some((player.current_time + 15.0).min(player.duration));
+                }
+
+                // Elapsed Time
+                ui.label(
+                    egui::RichText::new(format_time(player.current_time))
+                        .monospace()
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(190, 190, 195)),
+                );
+
+                // Scrubber Slider
+                let mut slider_val = player.current_time;
+                let slider_width = (ui.available_width() - 95.0).max(80.0);
+                let slider_resp = ui.add_sized(
+                    [slider_width, 18.0],
+                    egui::Slider::new(&mut slider_val, 0.0..=player.duration.max(1.0))
+                        .show_value(false),
+                );
+
+                if slider_resp.changed() {
+                    seek_to = Some(slider_val);
+                }
+
+                // Total Duration
+                ui.label(
+                    egui::RichText::new(format_time(player.duration))
+                        .monospace()
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(140, 140, 145)),
+                );
+
+                // Next Track >>
+                if ui
+                    .button(egui::RichText::new(">>").size(13.0))
+                    .on_hover_text("Next Sibling File")
+                    .clicked()
+                {
+                    nav_delta = Some(1);
+                }
+            });
+        });
+
+    if toggle_play {
+        player.toggle_playback();
+    }
+    if let Some(pos) = seek_to {
+        player.seek(pos);
+    }
+
+    nav_delta
+}
+
+fn render_media_player(
+    ui: &mut egui::Ui,
+    player: &mut MediaPlayer,
+    texture: Option<&egui::TextureHandle>,
+    size: u64,
     zoom_scale: &mut f32,
     pan_offset: &mut egui::Vec2,
-) {
+) -> Option<isize> {
+    if !player.is_video {
+        return render_audio_player(ui, player, texture, size);
+    }
+
     let available_rect = ui.available_rect_before_wrap();
     let mut seek_to = None;
     let mut toggle_play = false;
 
-    if player.is_video {
-        let video_area_height = (available_rect.height() - 70.0).max(100.0);
-        let (rect, response) = ui.allocate_exact_size(
-            egui::vec2(available_rect.width(), video_area_height),
-            egui::Sense::click_and_drag(),
-        );
+    let video_area_height = (available_rect.height() - 70.0).max(100.0);
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(available_rect.width(), video_area_height),
+        egui::Sense::click_and_drag(),
+    );
 
-        if response.clicked() {
-            toggle_play = true;
-        }
-        if response.dragged() {
-            *pan_offset += response.drag_delta();
-        }
+    if response.clicked() {
+        toggle_play = true;
+    }
+    if response.dragged() {
+        *pan_offset += response.drag_delta();
+    }
 
-        let scroll_delta = ui.input(|i| i.raw_scroll_delta.y);
-        if scroll_delta != 0.0 {
-            let factor = if scroll_delta > 0.0 { 1.1 } else { 0.9 };
-            *zoom_scale = (*zoom_scale * factor).clamp(0.1, 10.0);
-        }
+    let scroll_delta = ui.input(|i| i.raw_scroll_delta.y);
+    if scroll_delta != 0.0 {
+        let factor = if scroll_delta > 0.0 { 1.1 } else { 0.9 };
+        *zoom_scale = (*zoom_scale * factor).clamp(0.1, 10.0);
+    }
 
-        let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(12, 12, 14));
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(12, 12, 14));
 
-        if let Some(tex) = texture {
-            let aspect = if player.dimensions.1 > 0 {
-                (player.dimensions.0 as f32 / player.dimensions.1 as f32).max(0.1)
-            } else {
-                16.0 / 9.0
-            };
-
-            let mut fit_w = rect.width();
-            let mut fit_h = fit_w / aspect;
-            if fit_h > rect.height() {
-                fit_h = rect.height();
-                fit_w = fit_h * aspect;
-            }
-
-            fit_w *= *zoom_scale;
-            fit_h *= *zoom_scale;
-
-            let center = rect.center() + *pan_offset;
-            let img_rect = egui::Rect::from_center_size(center, egui::vec2(fit_w, fit_h));
-            let image = egui::Image::new(tex).fit_to_exact_size(egui::vec2(fit_w, fit_h));
-            image.paint_at(ui, img_rect);
-
-            // Subtle pause indicator overlay when paused
-            if !player.is_playing {
-                let badge_center = rect.center();
-                painter.circle_filled(badge_center, 36.0, egui::Color32::from_black_alpha(160));
-                painter.text(
-                    badge_center,
-                    egui::Align2::CENTER_CENTER,
-                    "▶",
-                    egui::FontId::proportional(28.0),
-                    egui::Color32::WHITE,
-                );
-            }
+    if let Some(tex) = texture {
+        let aspect = if player.dimensions.1 > 0 {
+            (player.dimensions.0 as f32 / player.dimensions.1 as f32).max(0.1)
         } else {
+            16.0 / 9.0
+        };
+
+        let mut fit_w = rect.width();
+        let mut fit_h = fit_w / aspect;
+        if fit_h > rect.height() {
+            fit_h = rect.height();
+            fit_w = fit_h * aspect;
+        }
+
+        fit_w *= *zoom_scale;
+        fit_h *= *zoom_scale;
+
+        let center = rect.center() + *pan_offset;
+        let img_rect = egui::Rect::from_center_size(center, egui::vec2(fit_w, fit_h));
+        let image = egui::Image::new(tex).fit_to_exact_size(egui::vec2(fit_w, fit_h));
+        image.paint_at(ui, img_rect);
+
+        // Subtle pause indicator overlay when paused
+        if !player.is_playing {
+            let badge_center = rect.center();
+            painter.circle_filled(badge_center, 36.0, egui::Color32::from_black_alpha(160));
             painter.text(
-                rect.center(),
+                badge_center,
                 egui::Align2::CENTER_CENTER,
-                "🎬 Starting video playback...",
-                egui::FontId::proportional(16.0),
-                egui::Color32::from_rgb(160, 160, 170),
+                "▶",
+                egui::FontId::proportional(28.0),
+                egui::Color32::WHITE,
             );
         }
     } else {
-        // Audio Viewport Area
-        let audio_area_height = (available_rect.height() - 70.0).max(100.0);
-        let (rect, response) = ui.allocate_exact_size(
-            egui::vec2(available_rect.width(), audio_area_height),
-            egui::Sense::click(),
-        );
-
-        if response.clicked() {
-            toggle_play = true;
-        }
-
-        let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(20, 20, 24));
-
-        let center_y = rect.center().y - 20.0;
         painter.text(
-            egui::pos2(rect.center().x, center_y - 40.0),
+            rect.center(),
             egui::Align2::CENTER_CENTER,
-            "🎵",
-            egui::FontId::proportional(48.0),
-            egui::Color32::WHITE,
+            "🎬 Starting video playback...",
+            egui::FontId::proportional(16.0),
+            egui::Color32::from_rgb(160, 160, 170),
         );
-
-        let name = player.path.file_name().and_then(|s| s.to_str()).unwrap_or("Audio Track");
-        painter.text(
-            egui::pos2(rect.center().x, center_y + 10.0),
-            egui::Align2::CENTER_CENTER,
-            name,
-            egui::FontId::proportional(18.0),
-            egui::Color32::WHITE,
-        );
-
-        // Animated Equalizer Waveform Bars (macOS style)
-        let bar_count = 32;
-        let bar_w = 4.0;
-        let spacing = 4.0;
-        let total_w = bar_count as f32 * (bar_w + spacing);
-        let start_x = rect.center().x - (total_w / 2.0);
-        let base_y = center_y + 60.0;
-        let t = player.current_time as f32;
-
-        for i in 0..bar_count {
-            let x = start_x + (i as f32 * (bar_w + spacing));
-            let height = if player.is_playing {
-                let wave = (t * 6.0 + i as f32 * 0.4).sin().abs() * 0.6
-                    + (t * 11.0 + i as f32 * 0.9).sin().abs() * 0.4;
-                6.0 + (wave * 30.0)
-            } else {
-                6.0
-            };
-            let bar_rect = egui::Rect::from_min_size(
-                egui::pos2(x, base_y - (height / 2.0)),
-                egui::vec2(bar_w, height),
-            );
-            let color = if player.is_playing {
-                egui::Color32::from_rgb(0, 122, 255) // macOS Accent Blue
-            } else {
-                egui::Color32::from_rgb(80, 80, 90)
-            };
-            painter.rect_filled(bar_rect, 2.0, color);
-        }
     }
 
     // Floating macOS Glass HUD at Bottom
@@ -1557,6 +1983,11 @@ fn render_media_player(
         .inner_margin(egui::Margin::symmetric(14.0, 8.0))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
+                // Rewind 15
+                if ui.button(egui::RichText::new("⟲15").size(13.0)).clicked() {
+                    seek_to = Some((player.current_time - 15.0).max(0.0));
+                }
+
                 // Play / Pause Button
                 let play_icon = if player.is_playing { "⏸" } else { "▶" };
                 if ui
@@ -1565,6 +1996,11 @@ fn render_media_player(
                     .clicked()
                 {
                     toggle_play = true;
+                }
+
+                // Forward 15
+                if ui.button(egui::RichText::new("15⟳").size(13.0)).clicked() {
+                    seek_to = Some((player.current_time + 15.0).min(player.duration));
                 }
 
                 // Time Elapsed
@@ -1625,6 +2061,8 @@ fn render_media_player(
     if let Some(pos) = seek_to {
         player.seek(pos);
     }
+
+    None
 }
 
 fn spawn_audio_process(path: &Path, start_secs: f64, volume: f32) -> Option<Child> {
@@ -1742,28 +2180,52 @@ fn format_time(seconds: f64) -> String {
     format!("{mins:02}:{secs:02}")
 }
 
-fn probe_media_info(path: &Path) -> (f64, (u32, u32)) {
+fn probe_media_info(path: &Path) -> (f64, (u32, u32), Option<AudioMetadata>) {
     let mut duration = 0.0;
     let mut dims = (854, 480);
+    let mut meta = AudioMetadata::default();
     let path_str = match path.to_str() {
         Some(s) => s,
-        None => return (duration, dims),
+        None => return (duration, dims, None),
     };
 
     if let Ok(out) = Command::new("ffprobe")
         .args([
             "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
+            "-show_entries", "format_tags=title,artist,album:format=duration",
+            "-of", "default=noprint_wrappers=1",
             path_str,
         ])
         .output()
     {
         if out.status.success() {
             let s = String::from_utf8_lossy(&out.stdout);
-            if let Ok(d) = s.trim().parse::<f64>() {
-                duration = d;
+            for line in s.lines() {
+                let trimmed = line.trim();
+                if let Some(val) = trimmed.strip_prefix("duration=") {
+                    if let Ok(d) = val.parse::<f64>() {
+                        duration = d;
+                        meta.duration = d;
+                    }
+                } else if let Some(val) = trimmed.strip_prefix("TAG:title=") {
+                    meta.title = val.to_string();
+                } else if let Some(val) = trimmed.strip_prefix("TAG:artist=") {
+                    meta.artist = val.to_string();
+                } else if let Some(val) = trimmed.strip_prefix("TAG:album=") {
+                    meta.album = val.to_string();
+                }
             }
+        }
+    }
+
+    if meta.title.is_empty() {
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            let clean = if let Some(pos) = stem.find(" - ") {
+                &stem[pos + 3..]
+            } else {
+                stem
+            };
+            meta.title = clean.to_string();
         }
     }
 
@@ -1790,7 +2252,7 @@ fn probe_media_info(path: &Path) -> (f64, (u32, u32)) {
         }
     }
 
-    (duration, dims)
+    (duration, dims, Some(meta))
 }
 
 fn render_media_viewer(
@@ -2186,6 +2648,90 @@ fn read_zip_entry(path: &Path, filter: impl Fn(&str) -> bool) -> Vec<(String, Ve
         Err(_) => return results,
     };
     let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if file_size < 22 {
+        return results;
+    }
+
+    // 1. Scan for End of Central Directory Record (EOCD) from EOF
+    let search_len = (file_size as usize).min(65536 + 22);
+    let search_offset = file_size - (search_len as u64);
+    if file.seek(SeekFrom::Start(search_offset)).is_ok() {
+        let mut search_buf = vec![0u8; search_len];
+        if file.read_exact(&mut search_buf).is_ok() {
+            let mut eocd_pos = None;
+            for i in (0..=search_len.saturating_sub(22)).rev() {
+                if search_buf[i..i + 4] == [0x50, 0x4b, 0x05, 0x06] {
+                    eocd_pos = Some(i);
+                    break;
+                }
+            }
+
+            if let Some(pos) = eocd_pos {
+                let eocd = &search_buf[pos..];
+                let total_entries = u16::from_le_bytes(eocd[10..12].try_into().unwrap()) as usize;
+                let cd_offset = u32::from_le_bytes(eocd[16..20].try_into().unwrap()) as u64;
+
+                let mut cd_cursor = cd_offset;
+                for _ in 0..total_entries {
+                    if file.seek(SeekFrom::Start(cd_cursor)).is_err() {
+                        break;
+                    }
+                    let mut cd_hdr = [0u8; 46];
+                    if file.read_exact(&mut cd_hdr).is_err() || cd_hdr[0..4] != [0x50, 0x4b, 0x01, 0x02] {
+                        break;
+                    }
+
+                    let method = u16::from_le_bytes(cd_hdr[10..12].try_into().unwrap());
+                    let comp_size = u32::from_le_bytes(cd_hdr[20..24].try_into().unwrap()) as usize;
+                    let name_len = u16::from_le_bytes(cd_hdr[28..30].try_into().unwrap()) as usize;
+                    let extra_len = u16::from_le_bytes(cd_hdr[30..32].try_into().unwrap()) as usize;
+                    let comment_len = u16::from_le_bytes(cd_hdr[32..34].try_into().unwrap()) as usize;
+                    let local_hdr_offset = u32::from_le_bytes(cd_hdr[42..46].try_into().unwrap()) as u64;
+
+                    let mut name_buf = vec![0u8; name_len];
+                    if file.read_exact(&mut name_buf).is_err() {
+                        break;
+                    }
+                    let name = String::from_utf8_lossy(&name_buf).to_string();
+                    cd_cursor += 46 + (name_len as u64) + (extra_len as u64) + (comment_len as u64);
+
+                    if filter(&name) {
+                        if file.seek(SeekFrom::Start(local_hdr_offset)).is_ok() {
+                            let mut local_hdr = [0u8; 30];
+                            if file.read_exact(&mut local_hdr).is_ok() && local_hdr[0..4] == [0x50, 0x4b, 0x03, 0x04] {
+                                let local_name_len = u16::from_le_bytes(local_hdr[26..28].try_into().unwrap()) as u64;
+                                let local_extra_len = u16::from_le_bytes(local_hdr[28..30].try_into().unwrap()) as u64;
+                                let data_offset = local_hdr_offset + 30 + local_name_len + local_extra_len;
+
+                                if file.seek(SeekFrom::Start(data_offset)).is_ok() {
+                                    let mut comp_data = vec![0u8; comp_size];
+                                    if file.read_exact(&mut comp_data).is_ok() {
+                                        let decompressed = if method == 0 {
+                                            Some(comp_data)
+                                        } else if method == 8 {
+                                            miniz_oxide::inflate::decompress_to_vec(&comp_data).ok()
+                                        } else {
+                                            None
+                                        };
+
+                                        if let Some(data) = decompressed {
+                                            results.push((name, data));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !results.is_empty() {
+                    return results;
+                }
+            }
+        }
+    }
+
+    // 2. Fallback: Sequential Local File Header walk
     let mut buffer = [0u8; 4];
     let mut offset = 0u64;
 
@@ -2193,10 +2739,7 @@ fn read_zip_entry(path: &Path, filter: impl Fn(&str) -> bool) -> Vec<(String, Ve
         if file.seek(SeekFrom::Start(offset)).is_err() {
             break;
         }
-        if file.read_exact(&mut buffer).is_err() {
-            break;
-        }
-        if buffer != [0x50, 0x4b, 0x03, 0x04] {
+        if file.read_exact(&mut buffer).is_err() || buffer != [0x50, 0x4b, 0x03, 0x04] {
             break;
         }
 
@@ -2218,7 +2761,7 @@ fn read_zip_entry(path: &Path, filter: impl Fn(&str) -> bool) -> Vec<(String, Ve
         let name = String::from_utf8_lossy(&name_bytes).to_string();
         let data_offset = offset + 30 + (name_len as u64) + (extra_len as u64);
 
-        if filter(&name) {
+        if filter(&name) && comp_size > 0 {
             if file.seek(SeekFrom::Start(data_offset)).is_ok() {
                 let mut comp_data = vec![0u8; comp_size];
                 if file.read_exact(&mut comp_data).is_ok() {
@@ -2236,6 +2779,9 @@ fn read_zip_entry(path: &Path, filter: impl Fn(&str) -> bool) -> Vec<(String, Ve
             }
         }
 
+        if comp_size == 0 {
+            break;
+        }
         offset = data_offset + (comp_size as u64);
     }
 
@@ -2244,36 +2790,52 @@ fn read_zip_entry(path: &Path, filter: impl Fn(&str) -> bool) -> Vec<(String, Ve
 
 fn load_pptx(path: &Path) -> FileKind {
     let entries = read_zip_entry(path, |name| {
-        (name.starts_with("ppt/slides/slide") && name.ends_with(".xml"))
-            || (name.starts_with("content.xml"))
+        (name.starts_with("ppt/slides/slide") && name.ends_with(".xml") && !name.contains("Layout") && !name.contains("Master") && !name.contains("_rels"))
+            || name == "content.xml"
     });
 
     let mut slides_data = Vec::new();
     for (name, data) in entries {
-        if name.starts_with("ppt/slides/slide") || name == "content.xml" {
+        if (name.starts_with("ppt/slides/slide") && name.ends_with(".xml")) || name == "content.xml" {
             slides_data.push((name, data));
         }
     }
 
     slides_data.sort_by_key(|(name, _)| {
-        name.trim_start_matches("ppt/slides/slide")
-            .trim_end_matches(".xml")
+        name.chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect::<String>()
             .parse::<usize>()
             .unwrap_or(0)
     });
 
     let mut slides = Vec::new();
-    for (_, data) in slides_data {
+    for (idx, (_, data)) in slides_data.into_iter().enumerate() {
         if let Ok(xml) = std::str::from_utf8(&data) {
-            let texts = extract_xml_tags(xml, "a:t");
-            if !texts.is_empty() {
-                let title = texts[0].clone();
-                let bullets = texts[1..].to_vec();
-                slides.push(SlideInfo { title, bullets });
+            let mut paras = extract_xml_paragraphs(xml);
+            if paras.is_empty() {
+                let tags = extract_xml_tags(xml, "a:t");
+                if !tags.is_empty() {
+                    paras = tags;
+                }
+            }
+
+            if !paras.is_empty() {
+                let title = paras[0].clone();
+                let bullets = paras[1..].to_vec();
+                let is_title_slide = idx == 0 || bullets.is_empty();
+                slides.push(SlideInfo {
+                    slide_number: idx + 1,
+                    title,
+                    bullets,
+                    is_title_slide,
+                });
             } else {
                 slides.push(SlideInfo {
-                    title: format!("Slide {}", slides.len() + 1),
+                    slide_number: idx + 1,
+                    title: format!("Slide {}", idx + 1),
                     bullets: vec![],
+                    is_title_slide: idx == 0,
                 });
             }
         }
@@ -2281,8 +2843,10 @@ fn load_pptx(path: &Path) -> FileKind {
 
     if slides.is_empty() {
         slides.push(SlideInfo {
+            slide_number: 1,
             title: "Presentation".into(),
-            bullets: vec!["No text extracted or slide in vector graphics format".into()],
+            bullets: vec!["Slide in vector/shape graphics format".into()],
+            is_title_slide: true,
         });
     }
 
@@ -2515,6 +3079,36 @@ fn extract_xml_tags(xml: &str, tag: &str) -> Vec<String> {
         cursor = abs_start + start_pattern.len();
     }
     results
+}
+
+fn extract_xml_paragraphs(xml: &str) -> Vec<String> {
+    let mut paras = Vec::new();
+    let p_open = "<a:p";
+    let p_close = "</a:p>";
+    let mut start = 0;
+
+    while let Some(open_idx) = xml[start..].find(p_open) {
+        let abs_open = start + open_idx;
+        let end_tag_idx = match xml[abs_open..].find('>') {
+            Some(i) => abs_open + i + 1,
+            None => break,
+        };
+        let close_idx = match xml[end_tag_idx..].find(p_close) {
+            Some(i) => end_tag_idx + i,
+            None => break,
+        };
+
+        let para_xml = &xml[end_tag_idx..close_idx];
+        let runs = extract_xml_tags(para_xml, "a:t");
+        let combined = runs.join("").trim().to_string();
+        if !combined.is_empty() {
+            paras.push(combined);
+        }
+
+        start = close_idx + p_close.len();
+    }
+
+    paras
 }
 
 fn decode_xml_entities(s: &str) -> String {
@@ -2930,5 +3524,37 @@ mod tests {
         let (w2, h2) = calculate_target_dims(1080, 1920, 854, 480);
         assert_eq!(h2, 480);
         assert_eq!(w2 % 2, 0);
+    }
+
+    #[test]
+    fn test_extract_xml_paragraphs() {
+        let xml = "<p:txBody><a:p><a:r><a:t>NET</a:t></a:r><a:r><a:t>WORK LAYER</a:t></a:r></a:p><a:p><a:r><a:t>Bullet point 1</a:t></a:r></a:p></p:txBody>";
+        let paras = extract_xml_paragraphs(xml);
+        assert_eq!(paras, vec!["NETWORK LAYER", "Bullet point 1"]);
+    }
+
+    #[test]
+    fn test_optimal_window_size() {
+        let mut app = QuickLookApp::new(None);
+        
+        // Audio
+        app.file_kind = FileKind::Media { kind: "Audio", poster_image: None };
+        let audio_sz = app.calculate_optimal_size();
+        assert_eq!(audio_sz, egui::vec2(580.0, 440.0));
+
+        // PDF
+        app.file_kind = FileKind::Pdf { current_page: 1, total_pages: 5, page_image: None };
+        let pdf_sz = app.calculate_optimal_size();
+        assert_eq!(pdf_sz, egui::vec2(1020.0, 880.0));
+
+        // PPTX
+        app.file_kind = FileKind::Presentation { slides: vec![], current_slide: 0 };
+        let ppt_sz = app.calculate_optimal_size();
+        assert_eq!(ppt_sz, egui::vec2(1140.0, 680.0));
+
+        // Portrait Image (e.g. 1000x2000)
+        app.file_kind = FileKind::Image { width: 1000, height: 2000, uri: "".into() };
+        let img_sz = app.calculate_optimal_size();
+        assert!(img_sz.x < img_sz.y);
     }
 }
