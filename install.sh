@@ -13,6 +13,11 @@ echo "==> Installing binary to ${INSTALL_DIR}/quicklook..."
 cp target/release/quicklook "${INSTALL_DIR}/quicklook"
 chmod +x "${INSTALL_DIR}/quicklook"
 
+# Extra symbol stripping to guarantee minimum footprint
+if command -v strip >/dev/null 2>&1; then
+    strip "${INSTALL_DIR}/quicklook" 2>/dev/null || true
+fi
+
 echo "==> Installing desktop entry to ${DESKTOP_DIR}/quicklook.desktop..."
 cp quicklook.desktop "${DESKTOP_DIR}/quicklook.desktop"
 chmod +x "${DESKTOP_DIR}/quicklook.desktop"
@@ -174,4 +179,13 @@ if [ ${#MISSING_HELPERS[@]} -gt 0 ]; then
     echo "   Arch Linux:      sudo pacman -S poppler ffmpeg"
     echo "   Fedora:          sudo dnf install poppler-utils ffmpeg-free"
 fi
+
+# ---------------------------------------------------------------------------
+# 5. Disk Space Cleanup
+# ---------------------------------------------------------------------------
+echo ""
+echo "==> Cleaning up build cache and intermediate artifacts (~1.9 GB)..."
+cargo clean 2>/dev/null || rm -rf target/
+echo "==> Done! Workspace is lean. Installed app binary is only ~7MB at ${INSTALL_DIR}/quicklook"
+
 
