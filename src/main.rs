@@ -2912,4 +2912,23 @@ mod tests {
         let path2 = parse_input_path("/home/karthik/plain_path.png");
         assert_eq!(path2, PathBuf::from("/home/karthik/plain_path.png"));
     }
+
+    #[test]
+    fn test_format_time() {
+        assert_eq!(format_time(0.0), "00:00");
+        assert_eq!(format_time(45.0), "00:45");
+        assert_eq!(format_time(75.0), "01:15");
+        assert_eq!(format_time(3665.0), "61:05");
+    }
+
+    #[test]
+    fn test_calculate_target_dims() {
+        let (w, h) = calculate_target_dims(1920, 1080, 854, 480);
+        assert_eq!(w, 854);
+        assert_eq!(h, 480);
+
+        let (w2, h2) = calculate_target_dims(1080, 1920, 854, 480);
+        assert_eq!(h2, 480);
+        assert_eq!(w2 % 2, 0);
+    }
 }
