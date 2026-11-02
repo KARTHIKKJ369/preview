@@ -2,6 +2,9 @@ use eframe::egui;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::time::Instant;
 
 /// macOS-style Quick Look preview application for Linux.
 fn main() -> eframe::Result<()> {
@@ -152,6 +155,7 @@ pub struct QuickLookApp {
     zoom_scale: f32,
     pan_offset: egui::Vec2,
     search_filter: String,
+    media_player: Option<MediaPlayer>,
 }
 
 impl QuickLookApp {
@@ -166,6 +170,7 @@ impl QuickLookApp {
             zoom_scale: 1.0,
             pan_offset: egui::Vec2::ZERO,
             search_filter: String::new(),
+            media_player: None,
         };
 
         if let Some(t) = target {
@@ -175,6 +180,9 @@ impl QuickLookApp {
     }
 
     fn set_target(&mut self, target: PathBuf) {
+        if let Some(mut mp) = self.media_player.take() {
+            mp.stop();
+        }
         let abs_path = fs::canonicalize(&target).unwrap_or(target);
         self.siblings = get_siblings(&abs_path);
         self.sibling_idx = self.siblings.iter().position(|p| p == &abs_path).unwrap_or(0);
@@ -189,6 +197,9 @@ impl QuickLookApp {
     fn navigate(&mut self, delta: isize) {
         if self.siblings.is_empty() {
             return;
+        }
+        if let Some(mut mp) = self.media_player.take() {
+            mp.stop();
         }
         let len = self.siblings.len() as isize;
         let new_idx = ((self.sibling_idx as isize + delta).rem_euclid(len)) as usize;
@@ -299,6 +310,8 @@ impl QuickLookApp {
         match ext.as_str() {
             "mp3" | "wav" | "ogg" | "flac" | "aac" | "m4a" | "opus" => {
                 let poster_image = extract_audio_art_to_image(path);
+                let (duration, dims) = probe_media_info(path);
+                self.media_player = Some(MediaPlayer::new(path, false, duration, dims));
                 self.file_kind = FileKind::Media {
                     kind: "Audio",
                     poster_image,
@@ -307,6 +320,8 @@ impl QuickLookApp {
             }
             "mp4" | "mkv" | "mov" | "webm" | "avi" | "wmv" | "flv" => {
                 let poster_image = extract_video_frame_to_image(path);
+                let (duration, dims) = probe_media_info(path);
+                self.media_player = Some(MediaPlayer::new(path, true, duration, dims));
                 self.file_kind = FileKind::Media {
                     kind: "Video",
                     poster_image,
@@ -380,6 +395,35 @@ impl QuickLookApp {
 
 impl eframe::App for QuickLookApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Drain incoming video frames and update media playback timer
+        if let Some(player) = &mut self.media_player {
+            if let Some(rx) = &player.frame_receiver {
+                let mut latest = None;
+                while let Ok(img) = rx.try_recv() {
+                    latest = Some(img);
+                }
+                if let Some(img) = latest {
+                    if let Some(tex) = &mut self.active_texture {
+                        tex.set(img, egui::TextureOptions::LINEAR);
+                    } else {
+                        self.active_texture = Some(ctx.load_texture("video_frame", img, egui::TextureOptions::LINEAR));
+                    }
+                }
+            }
+
+            if player.is_playing {
+                let now = Instant::now();
+                let dt = now.duration_since(player.last_tick).as_secs_f64();
+                player.last_tick = now;
+                player.current_time += dt;
+                if player.duration > 0.0 && player.current_time >= player.duration {
+                    player.pause_playback();
+                    player.current_time = player.duration;
+                }
+                ctx.request_repaint();
+            }
+        }
+
         // Keyboard Shortcuts (macOS Quick Look Behavior)
         ctx.input(|i| {
             if i.key_pressed(egui::Key::Escape)
@@ -387,6 +431,11 @@ impl eframe::App for QuickLookApp {
                 || i.key_pressed(egui::Key::Q)
             {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            if i.key_pressed(egui::Key::P) {
+                if let Some(player) = &mut self.media_player {
+                    player.toggle_playback();
+                }
             }
             if i.key_pressed(egui::Key::ArrowLeft)
                 || i.key_pressed(egui::Key::ArrowUp)
@@ -650,21 +699,32 @@ impl eframe::App for QuickLookApp {
                 }
             }
             FileKind::Media { kind, poster_image } => {
-                if self.active_texture.is_none() {
-                    if let Some(img) = poster_image.take() {
-                        self.active_texture = Some(ctx.load_texture("media_poster", img, egui::TextureOptions::LINEAR));
+                if let Some(player) = &mut self.media_player {
+                    render_media_player(
+                        ui,
+                        player,
+                        self.active_texture.as_ref(),
+                        self.file_size,
+                        &mut self.zoom_scale,
+                        &mut self.pan_offset,
+                    );
+                } else {
+                    if self.active_texture.is_none() {
+                        if let Some(img) = poster_image.take() {
+                            self.active_texture = Some(ctx.load_texture("media_poster", img, egui::TextureOptions::LINEAR));
+                        }
                     }
+                    let p = self.current_path.as_deref().unwrap_or(Path::new("media"));
+                    render_media_viewer(
+                        ui,
+                        p,
+                        kind,
+                        self.file_size,
+                        self.active_texture.as_ref(),
+                        &mut self.zoom_scale,
+                        &mut self.pan_offset,
+                    );
                 }
-                let p = self.current_path.as_deref().unwrap_or(Path::new("media"));
-                render_media_viewer(
-                    ui,
-                    p,
-                    kind,
-                    self.file_size,
-                    self.active_texture.as_ref(),
-                    &mut self.zoom_scale,
-                    &mut self.pan_offset,
-                );
             }
             FileKind::Hex { data, total_size } => {
                 render_hex_viewer(ui, data, *total_size);
@@ -682,6 +742,14 @@ impl eframe::App for QuickLookApp {
 
         if let Some(target) = target_to_set {
             self.set_target(target);
+        }
+    }
+}
+
+impl Drop for QuickLookApp {
+    fn drop(&mut self) {
+        if let Some(mut mp) = self.media_player.take() {
+            mp.stop();
         }
     }
 }
@@ -1229,6 +1297,500 @@ fn render_pdf_viewer(
     }
 
     page_change
+}
+
+pub struct MediaPlayer {
+    pub is_video: bool,
+    pub path: PathBuf,
+    pub is_playing: bool,
+    pub current_time: f64,
+    pub duration: f64,
+    pub volume: f32,
+    pub dimensions: (u32, u32),
+    pub frame_receiver: Option<Receiver<egui::ColorImage>>,
+    pub stop_sender: Option<Sender<()>>,
+    pub audio_child: Option<Child>,
+    pub video_child: Option<Child>,
+    pub last_tick: Instant,
+}
+
+impl MediaPlayer {
+    pub fn new(
+        path: &Path,
+        is_video: bool,
+        duration: f64,
+        dimensions: (u32, u32),
+    ) -> Self {
+        let mut player = Self {
+            is_video,
+            path: path.to_path_buf(),
+            is_playing: false,
+            current_time: 0.0,
+            duration: if duration > 0.0 { duration } else { 1.0 },
+            volume: 1.0,
+            dimensions,
+            frame_receiver: None,
+            stop_sender: None,
+            audio_child: None,
+            video_child: None,
+            last_tick: Instant::now(),
+        };
+
+        player.start_playback();
+        player
+    }
+
+    pub fn start_playback(&mut self) {
+        self.stop_processes();
+        self.is_playing = true;
+        self.last_tick = Instant::now();
+
+        self.audio_child = spawn_audio_process(&self.path, self.current_time, self.volume);
+
+        if self.is_video {
+            let (tx, rx) = channel();
+            let (stop_tx, stop_rx) = channel();
+            let target_dims = calculate_target_dims(self.dimensions.0, self.dimensions.1, 854, 480);
+            self.video_child = spawn_video_stream(&self.path, self.current_time, target_dims, tx, stop_rx);
+            self.frame_receiver = Some(rx);
+            self.stop_sender = Some(stop_tx);
+        }
+    }
+
+    pub fn pause_playback(&mut self) {
+        self.is_playing = false;
+        self.stop_processes();
+    }
+
+    pub fn toggle_playback(&mut self) {
+        if self.is_playing {
+            self.pause_playback();
+        } else {
+            if self.current_time >= self.duration {
+                self.current_time = 0.0;
+            }
+            self.start_playback();
+        }
+    }
+
+    pub fn seek(&mut self, new_time: f64) {
+        self.current_time = new_time.clamp(0.0, self.duration);
+        if self.is_playing {
+            self.start_playback();
+        }
+    }
+
+    pub fn stop_processes(&mut self) {
+        if let Some(stop_tx) = self.stop_sender.take() {
+            let _ = stop_tx.send(());
+        }
+        if let Some(mut child) = self.video_child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(mut child) = self.audio_child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.frame_receiver = None;
+    }
+
+    pub fn stop(&mut self) {
+        self.is_playing = false;
+        self.stop_processes();
+    }
+}
+
+impl Drop for MediaPlayer {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn render_media_player(
+    ui: &mut egui::Ui,
+    player: &mut MediaPlayer,
+    texture: Option<&egui::TextureHandle>,
+    _size: u64,
+    zoom_scale: &mut f32,
+    pan_offset: &mut egui::Vec2,
+) {
+    let available_rect = ui.available_rect_before_wrap();
+    let mut seek_to = None;
+    let mut toggle_play = false;
+
+    if player.is_video {
+        let video_area_height = (available_rect.height() - 70.0).max(100.0);
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(available_rect.width(), video_area_height),
+            egui::Sense::click_and_drag(),
+        );
+
+        if response.clicked() {
+            toggle_play = true;
+        }
+        if response.dragged() {
+            *pan_offset += response.drag_delta();
+        }
+
+        let scroll_delta = ui.input(|i| i.raw_scroll_delta.y);
+        if scroll_delta != 0.0 {
+            let factor = if scroll_delta > 0.0 { 1.1 } else { 0.9 };
+            *zoom_scale = (*zoom_scale * factor).clamp(0.1, 10.0);
+        }
+
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(12, 12, 14));
+
+        if let Some(tex) = texture {
+            let aspect = if player.dimensions.1 > 0 {
+                (player.dimensions.0 as f32 / player.dimensions.1 as f32).max(0.1)
+            } else {
+                16.0 / 9.0
+            };
+
+            let mut fit_w = rect.width();
+            let mut fit_h = fit_w / aspect;
+            if fit_h > rect.height() {
+                fit_h = rect.height();
+                fit_w = fit_h * aspect;
+            }
+
+            fit_w *= *zoom_scale;
+            fit_h *= *zoom_scale;
+
+            let center = rect.center() + *pan_offset;
+            let img_rect = egui::Rect::from_center_size(center, egui::vec2(fit_w, fit_h));
+            let image = egui::Image::new(tex).fit_to_exact_size(egui::vec2(fit_w, fit_h));
+            image.paint_at(ui, img_rect);
+
+            // Subtle pause indicator overlay when paused
+            if !player.is_playing {
+                let badge_center = rect.center();
+                painter.circle_filled(badge_center, 36.0, egui::Color32::from_black_alpha(160));
+                painter.text(
+                    badge_center,
+                    egui::Align2::CENTER_CENTER,
+                    "▶",
+                    egui::FontId::proportional(28.0),
+                    egui::Color32::WHITE,
+                );
+            }
+        } else {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "🎬 Starting video playback...",
+                egui::FontId::proportional(16.0),
+                egui::Color32::from_rgb(160, 160, 170),
+            );
+        }
+    } else {
+        // Audio Viewport Area
+        let audio_area_height = (available_rect.height() - 70.0).max(100.0);
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(available_rect.width(), audio_area_height),
+            egui::Sense::click(),
+        );
+
+        if response.clicked() {
+            toggle_play = true;
+        }
+
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(20, 20, 24));
+
+        let center_y = rect.center().y - 20.0;
+        painter.text(
+            egui::pos2(rect.center().x, center_y - 40.0),
+            egui::Align2::CENTER_CENTER,
+            "🎵",
+            egui::FontId::proportional(48.0),
+            egui::Color32::WHITE,
+        );
+
+        let name = player.path.file_name().and_then(|s| s.to_str()).unwrap_or("Audio Track");
+        painter.text(
+            egui::pos2(rect.center().x, center_y + 10.0),
+            egui::Align2::CENTER_CENTER,
+            name,
+            egui::FontId::proportional(18.0),
+            egui::Color32::WHITE,
+        );
+
+        // Animated Equalizer Waveform Bars (macOS style)
+        let bar_count = 32;
+        let bar_w = 4.0;
+        let spacing = 4.0;
+        let total_w = bar_count as f32 * (bar_w + spacing);
+        let start_x = rect.center().x - (total_w / 2.0);
+        let base_y = center_y + 60.0;
+        let t = player.current_time as f32;
+
+        for i in 0..bar_count {
+            let x = start_x + (i as f32 * (bar_w + spacing));
+            let height = if player.is_playing {
+                let wave = (t * 6.0 + i as f32 * 0.4).sin().abs() * 0.6
+                    + (t * 11.0 + i as f32 * 0.9).sin().abs() * 0.4;
+                6.0 + (wave * 30.0)
+            } else {
+                6.0
+            };
+            let bar_rect = egui::Rect::from_min_size(
+                egui::pos2(x, base_y - (height / 2.0)),
+                egui::vec2(bar_w, height),
+            );
+            let color = if player.is_playing {
+                egui::Color32::from_rgb(0, 122, 255) // macOS Accent Blue
+            } else {
+                egui::Color32::from_rgb(80, 80, 90)
+            };
+            painter.rect_filled(bar_rect, 2.0, color);
+        }
+    }
+
+    // Floating macOS Glass HUD at Bottom
+    egui::Frame::canvas(ui.style())
+        .fill(egui::Color32::from_black_alpha(220))
+        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(50, 50, 60)))
+        .rounding(egui::Rounding::same(8.0))
+        .inner_margin(egui::Margin::symmetric(14.0, 8.0))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                // Play / Pause Button
+                let play_icon = if player.is_playing { "⏸" } else { "▶" };
+                if ui
+                    .button(egui::RichText::new(play_icon).size(16.0).strong())
+                    .on_hover_text("Play / Pause (Click or press P)")
+                    .clicked()
+                {
+                    toggle_play = true;
+                }
+
+                // Time Elapsed
+                ui.label(
+                    egui::RichText::new(format_time(player.current_time))
+                        .monospace()
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(200, 200, 210)),
+                );
+
+                // Scrubber Slider
+                let mut slider_val = player.current_time;
+                let slider_resp = ui.add_sized(
+                    [ui.available_width() - 210.0, 18.0],
+                    egui::Slider::new(&mut slider_val, 0.0..=player.duration.max(1.0))
+                        .show_value(false),
+                );
+
+                if slider_resp.changed() {
+                    seek_to = Some(slider_val);
+                }
+
+                // Time Total
+                ui.label(
+                    egui::RichText::new(format_time(player.duration))
+                        .monospace()
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(140, 140, 150)),
+                );
+
+                ui.separator();
+
+                // Volume Icon + Slider
+                let vol_icon = if player.volume <= 0.01 { "🔇" } else { "🔊" };
+                ui.label(vol_icon);
+                ui.add_sized(
+                    [55.0, 18.0],
+                    egui::Slider::new(&mut player.volume, 0.0..=1.0).show_value(false),
+                );
+
+                // Open with App
+                if ui
+                    .button(
+                        egui::RichText::new("↗")
+                            .color(egui::Color32::from_rgb(200, 200, 255)),
+                    )
+                    .on_hover_text("Open in default system player")
+                    .clicked()
+                {
+                    let _ = open::that(&player.path);
+                }
+            });
+        });
+
+    if toggle_play {
+        player.toggle_playback();
+    }
+    if let Some(pos) = seek_to {
+        player.seek(pos);
+    }
+}
+
+fn spawn_audio_process(path: &Path, start_secs: f64, volume: f32) -> Option<Child> {
+    let path_str = path.to_str()?;
+    let vol_int = (volume.clamp(0.0, 1.0) * 100.0) as u32;
+    let start_str = format!("{:.2}", start_secs.max(0.0));
+
+    if let Ok(child) = Command::new("ffplay")
+        .args([
+            "-nodisp",
+            "-autoexit",
+            "-loglevel", "quiet",
+            "-ss", &start_str,
+            "-volume", &vol_int.to_string(),
+            path_str,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        return Some(child);
+    }
+
+    if let Ok(child) = Command::new("mpv")
+        .args([
+            "--no-video",
+            &format!("--start={start_str}"),
+            &format!("--volume={vol_int}"),
+            path_str,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        return Some(child);
+    }
+
+    None
+}
+
+fn spawn_video_stream(
+    path: &Path,
+    start_secs: f64,
+    target_dims: (u32, u32),
+    tx: Sender<egui::ColorImage>,
+    stop_rx: Receiver<()>,
+) -> Option<Child> {
+    let path_str = path.to_str()?;
+    let (w, h) = target_dims;
+    let start_str = format!("{:.2}", start_secs.max(0.0));
+    let scale_filter = format!("scale={w}:{h}");
+
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args([
+        "-re",
+        "-ss", &start_str,
+        "-i", path_str,
+        "-vf", &scale_filter,
+        "-f", "rawvideo",
+        "-pix_fmt", "rgba",
+        "-",
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
+
+    let mut child = cmd.spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+
+    std::thread::spawn(move || {
+        let frame_size = (w * h * 4) as usize;
+        let mut buffer = vec![0u8; frame_size];
+
+        while stop_rx.try_recv().is_err() {
+            if stdout.read_exact(&mut buffer).is_err() {
+                break;
+            }
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                [w as usize, h as usize],
+                &buffer,
+            );
+            if tx.send(color_image).is_err() {
+                break;
+            }
+        }
+    });
+
+    Some(child)
+}
+
+fn calculate_target_dims(orig_w: u32, orig_h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
+    if orig_w == 0 || orig_h == 0 {
+        return (640, 360);
+    }
+    let aspect = orig_w as f32 / orig_h as f32;
+    let mut w = max_w;
+    let mut h = (w as f32 / aspect).round() as u32;
+
+    if h > max_h {
+        h = max_h;
+        w = (h as f32 * aspect).round() as u32;
+    }
+
+    w = (w / 2) * 2;
+    h = (h / 2) * 2;
+    (w.max(320), h.max(180))
+}
+
+fn format_time(seconds: f64) -> String {
+    let total_secs = seconds.max(0.0) as u64;
+    let mins = total_secs / 60;
+    let secs = total_secs % 60;
+    format!("{mins:02}:{secs:02}")
+}
+
+fn probe_media_info(path: &Path) -> (f64, (u32, u32)) {
+    let mut duration = 0.0;
+    let mut dims = (854, 480);
+    let path_str = match path.to_str() {
+        Some(s) => s,
+        None => return (duration, dims),
+    };
+
+    if let Ok(out) = Command::new("ffprobe")
+        .args([
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            path_str,
+        ])
+        .output()
+    {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout);
+            if let Ok(d) = s.trim().parse::<f64>() {
+                duration = d;
+            }
+        }
+    }
+
+    if let Ok(out) = Command::new("ffprobe")
+        .args([
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "csv=s=x:p=0",
+            path_str,
+        ])
+        .output()
+    {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let parts: Vec<&str> = s.split('x').collect();
+            if parts.len() == 2 {
+                if let (Ok(w), Ok(h)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
+                    if w > 0 && h > 0 {
+                        dims = (w, h);
+                    }
+                }
+            }
+        }
+    }
+
+    (duration, dims)
 }
 
 fn render_media_viewer(

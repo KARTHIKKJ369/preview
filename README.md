@@ -24,18 +24,20 @@ macOS Quick Look achieves its instant, zero-lag feel through four core design de
 | **Directories** | Any directory / folder | File count, folder contents table with file icons, sizes, and relative modification timestamps |
 | **Archives** | `.zip`, `.jar`, `.war` | Direct header inspection listing archive contents without extracting |
 | **PDF** | `.pdf` | Visual in-window page rendering (poppler / Ghostscript / mutool / XDG cache), page counter, interactive PageUp/PageDown page flipping, zoom & pan |
-| **Video & Audio** | `.mp4`, `.mkv`, `.mov`, `.webm`, `.avi`, `.mp3`, `.wav`, `.flac`, `.ogg` | Visual video frame preview & album art extraction (ffmpeg / ffmpegthumbnailer / mpv / Dolphin XDG cache), "▶ Play in Player" quick button |
+| **Video** | `.mp4`, `.mkv`, `.mov`, `.webm`, `.avi`, `.wmv` | In-window real-time video playback at 30/60 fps with audio, floating macOS glass HUD, Play/Pause toggle, draggable scrubber seekbar (`00:15 / 02:40`), volume slider |
+| **Audio** | `.mp3`, `.wav`, `.flac`, `.ogg`, `.m4a`, `.opus` | In-window audio playback with live animated 32-band equalizer waveform bars, floating HUD controls, Play/Pause, scrubber seekbar, volume slider |
 | **Binary Fallback** | Any unknown binary (`.bin`, `.so`, `.dat`, executables) | 3-column macOS Quick Look-style Hex Viewer (`Offset`, `Hex`, `ASCII`) |
 
 ## Keyboard & Mouse Shortcuts
 
 - `Space` / `Esc` / `q` : Close window immediately
+- `P` / Click video   : Play / Pause media playback
 - `◀` / `Left Arrow` / `Up Arrow` / `k` : Previous file in folder
 - `▶` / `Right Arrow` / `Down Arrow` / `j` : Next file in folder
 - `+` / `-` / `0` : Zoom in, zoom out, reset zoom (100%)
 - `Enter` / `o` : Open file in default desktop application (`xdg-open`)
-- `Mouse Drag` : Pan image
-- `Scroll Wheel` : Zoom image or scroll document
+- `Mouse Drag` : Pan image / video
+- `Scroll Wheel` : Zoom image / video or scroll document
 
 ## Building & Installation
 
