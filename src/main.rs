@@ -1,4 +1,5 @@
 use eframe::egui;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -70,7 +71,6 @@ fn configure_mac_style(ctx: &egui::Context) {
     ctx.set_visuals(visuals);
 }
 
-#[derive(Debug)]
 pub enum FileKind {
     Welcome,
     Image {
@@ -94,7 +94,7 @@ pub enum FileKind {
         total_cols: usize,
     },
     Presentation {
-        slides: Vec<SlideInfo>,
+        presentation: PresentationData,
         current_slide: usize,
     },
     Document {
@@ -112,7 +112,8 @@ pub enum FileKind {
     Pdf {
         current_page: usize,
         total_pages: usize,
-        page_image: Option<egui::ColorImage>,
+        page_images: HashMap<usize, egui::ColorImage>,
+        page_textures: HashMap<usize, egui::TextureHandle>,
     },
     Media {
         kind: &'static str,
@@ -125,12 +126,116 @@ pub enum FileKind {
     Error(String),
 }
 
+impl std::fmt::Debug for FileKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Welcome => write!(f, "Welcome"),
+            Self::Image { width, height, uri } => f
+                .debug_struct("Image")
+                .field("width", width)
+                .field("height", height)
+                .field("uri", uri)
+                .finish(),
+            Self::Code { language, lines, truncated, .. } => f
+                .debug_struct("Code")
+                .field("language", language)
+                .field("lines", lines)
+                .field("truncated", truncated)
+                .finish(),
+            Self::Markdown { lines, .. } => f
+                .debug_struct("Markdown")
+                .field("lines", lines)
+                .finish(),
+            Self::Spreadsheet { total_rows, total_cols, .. } => f
+                .debug_struct("Spreadsheet")
+                .field("total_rows", total_rows)
+                .field("total_cols", total_cols)
+                .finish(),
+            Self::Presentation { presentation, current_slide } => f
+                .debug_struct("Presentation")
+                .field("aspect_ratio", &presentation.aspect_ratio)
+                .field("slides_len", &presentation.slides.len())
+                .field("current_slide", current_slide)
+                .finish(),
+            Self::Document { word_count, paragraphs } => f
+                .debug_struct("Document")
+                .field("word_count", word_count)
+                .field("paragraphs_len", &paragraphs.len())
+                .finish(),
+            Self::Directory { total_items, .. } => f
+                .debug_struct("Directory")
+                .field("total_items", total_items)
+                .finish(),
+            Self::Archive { total_entries, .. } => f
+                .debug_struct("Archive")
+                .field("total_entries", total_entries)
+                .finish(),
+            Self::Pdf { current_page, total_pages, page_images, page_textures } => f
+                .debug_struct("Pdf")
+                .field("current_page", current_page)
+                .field("total_pages", total_pages)
+                .field("page_images_len", &page_images.len())
+                .field("page_textures_len", &page_textures.len())
+                .finish(),
+            Self::Media { kind, poster_image } => f
+                .debug_struct("Media")
+                .field("kind", kind)
+                .field("has_poster", &poster_image.is_some())
+                .finish(),
+            Self::Hex { total_size, .. } => f
+                .debug_struct("Hex")
+                .field("total_size", total_size)
+                .finish(),
+            Self::Error(err) => f.debug_tuple("Error").field(err).finish(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
-pub struct SlideInfo {
+pub struct PresentationData {
+    pub aspect_ratio: f32,
+    pub slides: Vec<SlideData>,
+}
+
+impl Default for PresentationData {
+    fn default() -> Self {
+        Self {
+            aspect_ratio: 16.0 / 9.0,
+            slides: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SlideData {
     pub slide_number: usize,
     pub title: String,
-    pub bullets: Vec<String>,
+    pub subtitle: Option<String>,
+    pub background_color: Option<egui::Color32>,
+    pub blocks: Vec<SlideContentBlock>,
+    pub tables: Vec<SlideTableData>,
+    pub footers: Vec<String>,
     pub is_title_slide: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum SlideContentBlock {
+    Paragraph {
+        text: String,
+        bold: bool,
+        level: usize,
+        is_bullet: bool,
+    },
+    Card {
+        header: Option<String>,
+        items: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct SlideTableData {
+    pub headers: Vec<String>,
+    pub rows: Vec<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -155,6 +260,78 @@ pub struct DirItem {
     pub modified_str: String,
 }
 
+pub struct PdfPageRequest {
+    pub path: PathBuf,
+    pub page: usize,
+    pub generation: usize,
+}
+
+pub struct PdfPageResponse {
+    pub path: PathBuf,
+    pub generation: usize,
+    pub page: usize,
+    pub image: Option<egui::ColorImage>,
+}
+
+pub struct PdfLoader {
+    pub request_tx: Sender<PdfPageRequest>,
+    pub response_rx: Receiver<PdfPageResponse>,
+    pub generation: usize,
+    pub in_flight: HashSet<usize>,
+    pub failed: HashSet<usize>,
+}
+
+impl PdfLoader {
+    pub fn new() -> Self {
+        let (request_tx, request_rx) = channel::<PdfPageRequest>();
+        let (response_tx, response_rx) = channel::<PdfPageResponse>();
+
+        std::thread::spawn(move || {
+            while let Ok(req) = request_rx.recv() {
+                let img = render_pdf_page_to_image(&req.path, req.page);
+                let _ = response_tx.send(PdfPageResponse {
+                    path: req.path,
+                    generation: req.generation,
+                    page: req.page,
+                    image: img,
+                });
+            }
+        });
+
+        Self {
+            request_tx,
+            response_rx,
+            generation: 0,
+            in_flight: HashSet::new(),
+            failed: HashSet::new(),
+        }
+    }
+
+    pub fn request_page(&mut self, path: &Path, page: usize) {
+        if self.in_flight.contains(&page) || self.failed.contains(&page) {
+            return;
+        }
+        self.in_flight.insert(page);
+        let _ = self.request_tx.send(PdfPageRequest {
+            path: path.to_path_buf(),
+            page,
+            generation: self.generation,
+        });
+    }
+
+    pub fn reset_for_new_file(&mut self) {
+        self.generation += 1;
+        self.in_flight.clear();
+        self.failed.clear();
+    }
+}
+
+impl Default for PdfLoader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct QuickLookApp {
     current_path: Option<PathBuf>,
     siblings: Vec<PathBuf>,
@@ -167,6 +344,8 @@ pub struct QuickLookApp {
     search_filter: String,
     media_player: Option<MediaPlayer>,
     pending_resize: Option<egui::Vec2>,
+    pdf_loader: PdfLoader,
+    pdf_scroll_target: Option<usize>,
 }
 
 impl QuickLookApp {
@@ -183,6 +362,8 @@ impl QuickLookApp {
             search_filter: String::new(),
             media_player: None,
             pending_resize: None,
+            pdf_loader: PdfLoader::new(),
+            pdf_scroll_target: None,
         };
 
         if let Some(t) = target {
@@ -273,6 +454,8 @@ impl QuickLookApp {
         self.zoom_scale = 1.0;
         self.pan_offset = egui::Vec2::ZERO;
         self.search_filter.clear();
+        self.pdf_loader.reset_for_new_file();
+        self.pdf_scroll_target = None;
         self.load_current_file();
     }
 
@@ -291,6 +474,8 @@ impl QuickLookApp {
         self.zoom_scale = 1.0;
         self.pan_offset = egui::Vec2::ZERO;
         self.search_filter.clear();
+        self.pdf_loader.reset_for_new_file();
+        self.pdf_scroll_target = None;
         self.load_current_file();
     }
 
@@ -425,12 +610,21 @@ impl QuickLookApp {
 
         // 7. PDF
         if ext == "pdf" {
-            let total_pages = pdf_get_total_pages(path);
-            let page_image = render_pdf_page_to_image(path, 1);
+            let total_pages = pdf_get_total_pages(path).max(1);
+            let mut page_images = HashMap::new();
+            if let Some(img) = render_pdf_page_to_image(path, 1) {
+                page_images.insert(1, img);
+            } else {
+                self.pdf_loader.request_page(path, 1);
+            }
+            if total_pages > 1 {
+                self.pdf_loader.request_page(path, 2);
+            }
             self.set_loaded_kind(FileKind::Pdf {
                 current_page: 1,
                 total_pages,
-                page_image,
+                page_images,
+                page_textures: HashMap::new(),
             });
             return;
         }
@@ -514,9 +708,21 @@ impl eframe::App for QuickLookApp {
                 let dt = now.duration_since(player.last_tick).as_secs_f64();
                 player.last_tick = now;
                 player.current_time += dt;
-                if player.duration > 0.0 && player.current_time >= player.duration {
-                    player.pause_playback();
-                    player.current_time = player.duration;
+
+                let finished = player.check_eof_and_reap();
+                if !finished && player.duration > 0.0 && player.current_time >= player.duration {
+                    let still_running = if player.is_video {
+                        player.video_child.as_mut().map(|c| c.try_wait().map(|s| s.is_none()).unwrap_or(false)).unwrap_or(false)
+                    } else {
+                        player.audio_child.as_mut().map(|c| c.try_wait().map(|s| s.is_none()).unwrap_or(false)).unwrap_or(false)
+                    };
+
+                    if still_running {
+                        player.duration = player.current_time + 1.0;
+                    } else {
+                        player.pause_playback();
+                        player.current_time = player.duration;
+                    }
                 }
                 ctx.request_repaint();
             }
@@ -524,31 +730,23 @@ impl eframe::App for QuickLookApp {
 
         // Keyboard Shortcuts (macOS Quick Look Behavior)
         ctx.input(|i| {
-            if i.key_pressed(egui::Key::Escape)
-                || i.key_pressed(egui::Key::Space)
-                || i.key_pressed(egui::Key::Q)
-            {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            let is_presentation = matches!(self.file_kind, FileKind::Presentation { .. });
+
+            // 1. External editor / file open (Universal: O or Enter)
+            if i.key_pressed(egui::Key::O) || i.key_pressed(egui::Key::Enter) {
+                if let Some(ref path) = self.current_path {
+                    let _ = open::that(path);
+                }
             }
+
+            // 2. Media playback toggle (Universal: P)
             if i.key_pressed(egui::Key::P) {
                 if let Some(player) = &mut self.media_player {
                     player.toggle_playback();
                 }
             }
-            if i.key_pressed(egui::Key::ArrowLeft)
-                || i.key_pressed(egui::Key::ArrowUp)
-                || i.key_pressed(egui::Key::K)
-                || i.key_pressed(egui::Key::OpenBracket)
-            {
-                self.navigate(-1);
-            }
-            if i.key_pressed(egui::Key::ArrowRight)
-                || i.key_pressed(egui::Key::ArrowDown)
-                || i.key_pressed(egui::Key::J)
-                || i.key_pressed(egui::Key::CloseBracket)
-            {
-                self.navigate(1);
-            }
+
+            // 3. Zoom controls (Universal: +, -, 0)
             if i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals) {
                 self.zoom_scale = (self.zoom_scale * 1.2).min(10.0);
             }
@@ -559,41 +757,112 @@ impl eframe::App for QuickLookApp {
                 self.zoom_scale = 1.0;
                 self.pan_offset = egui::Vec2::ZERO;
             }
-            if i.key_pressed(egui::Key::PageDown) {
-                if let FileKind::Presentation { current_slide, slides } = &mut self.file_kind {
-                    if *current_slide + 1 < slides.len() {
-                        *current_slide += 1;
-                    }
+
+            if is_presentation {
+                // --- PRESENTATION MODE KEYBOARD ROUTING ---
+                if i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Q) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
-                if let FileKind::Pdf { current_page, total_pages, page_image } = &mut self.file_kind {
-                    if *current_page < *total_pages {
-                        *current_page += 1;
-                        if let Some(ref path) = self.current_path {
-                            *page_image = render_pdf_page_to_image(path, *current_page);
-                            self.active_texture = None;
+
+                let alt = i.modifiers.alt;
+                let shift = i.modifiers.shift;
+
+                if alt {
+                    if i.key_pressed(egui::Key::ArrowLeft)
+                        || i.key_pressed(egui::Key::ArrowUp)
+                        || i.key_pressed(egui::Key::OpenBracket)
+                    {
+                        self.navigate(-1);
+                    }
+                    if i.key_pressed(egui::Key::ArrowRight)
+                        || i.key_pressed(egui::Key::ArrowDown)
+                        || i.key_pressed(egui::Key::CloseBracket)
+                    {
+                        self.navigate(1);
+                    }
+                } else {
+                    let next_slide = i.key_pressed(egui::Key::ArrowRight)
+                        || i.key_pressed(egui::Key::ArrowDown)
+                        || i.key_pressed(egui::Key::PageDown)
+                        || i.key_pressed(egui::Key::J)
+                        || (i.key_pressed(egui::Key::Space) && !shift);
+
+                    let prev_slide = i.key_pressed(egui::Key::ArrowLeft)
+                        || i.key_pressed(egui::Key::ArrowUp)
+                        || i.key_pressed(egui::Key::PageUp)
+                        || i.key_pressed(egui::Key::K)
+                        || i.key_pressed(egui::Key::Backspace)
+                        || (i.key_pressed(egui::Key::Space) && shift);
+
+                    let first_slide = i.key_pressed(egui::Key::Home);
+                    let last_slide = i.key_pressed(egui::Key::End);
+
+                    if let FileKind::Presentation { presentation, current_slide } = &mut self.file_kind {
+                        let total = presentation.slides.len();
+                        if total > 0 {
+                            if next_slide && *current_slide + 1 < total {
+                                *current_slide += 1;
+                            } else if prev_slide && *current_slide > 0 {
+                                *current_slide -= 1;
+                            } else if first_slide {
+                                *current_slide = 0;
+                            } else if last_slide {
+                                *current_slide = total - 1;
+                            }
                         }
                     }
                 }
-            }
-            if i.key_pressed(egui::Key::PageUp) {
-                if let FileKind::Presentation { current_slide, .. } = &mut self.file_kind {
-                    if *current_slide > 0 {
-                        *current_slide -= 1;
-                    }
+            } else {
+                // --- STANDARD PREVIEW MODE ---
+                if i.key_pressed(egui::Key::Escape)
+                    || i.key_pressed(egui::Key::Space)
+                    || i.key_pressed(egui::Key::Q)
+                {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
-                if let FileKind::Pdf { current_page, page_image, .. } = &mut self.file_kind {
-                    if *current_page > 1 {
-                        *current_page -= 1;
-                        if let Some(ref path) = self.current_path {
-                            *page_image = render_pdf_page_to_image(path, *current_page);
-                            self.active_texture = None;
+
+                if i.key_pressed(egui::Key::ArrowLeft)
+                    || i.key_pressed(egui::Key::ArrowUp)
+                    || i.key_pressed(egui::Key::K)
+                    || i.key_pressed(egui::Key::OpenBracket)
+                {
+                    self.navigate(-1);
+                }
+                if i.key_pressed(egui::Key::ArrowRight)
+                    || i.key_pressed(egui::Key::ArrowDown)
+                    || i.key_pressed(egui::Key::J)
+                    || i.key_pressed(egui::Key::CloseBracket)
+                {
+                    self.navigate(1);
+                }
+
+                if i.key_pressed(egui::Key::PageDown) {
+                    if let FileKind::Pdf { current_page, total_pages, .. } = &mut self.file_kind {
+                        if *current_page < *total_pages {
+                            *current_page += 1;
+                            self.pdf_scroll_target = Some(*current_page);
                         }
                     }
                 }
-            }
-            if i.key_pressed(egui::Key::O) || i.key_pressed(egui::Key::Enter) {
-                if let Some(ref path) = self.current_path {
-                    let _ = open::that(path);
+                if i.key_pressed(egui::Key::PageUp) {
+                    if let FileKind::Pdf { current_page, .. } = &mut self.file_kind {
+                        if *current_page > 1 {
+                            *current_page -= 1;
+                            self.pdf_scroll_target = Some(*current_page);
+                        }
+                    }
+                }
+                if i.key_pressed(egui::Key::Home) {
+                    if let FileKind::Pdf { current_page, .. } = &mut self.file_kind {
+                        *current_page = 1;
+                        self.pdf_scroll_target = Some(1);
+                    }
+                }
+                if i.key_pressed(egui::Key::End) {
+                    if let FileKind::Pdf { current_page, total_pages, .. } = &mut self.file_kind {
+                        *current_page = *total_pages;
+                        self.pdf_scroll_target = Some(*total_pages);
+                    }
                 }
             }
         });
@@ -677,8 +946,8 @@ impl eframe::App for QuickLookApp {
                         FileKind::Spreadsheet { total_rows, total_cols, .. } => {
                             format!("·  Spreadsheet · {total_rows} rows × {total_cols} cols")
                         }
-                        FileKind::Presentation { slides, current_slide } => {
-                            format!("·  Presentation · Slide {}/{}", current_slide + 1, slides.len())
+                        FileKind::Presentation { presentation, current_slide } => {
+                            format!("·  Presentation · Slide {}/{}", current_slide + 1, presentation.slides.len())
                         }
                         FileKind::Document { word_count, paragraphs } => {
                             format!("·  Document · ~{word_count} words · {} paragraphs", paragraphs.len())
@@ -765,8 +1034,8 @@ impl eframe::App for QuickLookApp {
                     target_to_set = Some(p);
                 }
             }
-            FileKind::Image { uri, .. } => {
-                render_image_viewer(ui, uri, &mut self.zoom_scale, &mut self.pan_offset);
+            FileKind::Image { uri, width, height } => {
+                render_image_viewer(ui, uri, *width, *height, &mut self.zoom_scale, &mut self.pan_offset);
             }
             FileKind::Code { content, language, .. } => {
                 render_code_viewer(ui, content, language);
@@ -777,8 +1046,8 @@ impl eframe::App for QuickLookApp {
             FileKind::Spreadsheet { rows, total_rows, total_cols } => {
                 render_spreadsheet_viewer(ui, rows, *total_rows, *total_cols, &mut self.search_filter);
             }
-            FileKind::Presentation { slides, current_slide } => {
-                render_presentation_viewer(ui, slides, current_slide);
+            FileKind::Presentation { presentation, current_slide } => {
+                render_presentation_viewer(ui, presentation, current_slide);
             }
             FileKind::Document { paragraphs, word_count } => {
                 render_document_viewer(ui, paragraphs, *word_count);
@@ -789,25 +1058,69 @@ impl eframe::App for QuickLookApp {
             FileKind::Archive { entries, .. } => {
                 render_archive_viewer(ui, entries, &mut self.search_filter);
             }
-            FileKind::Pdf { current_page, total_pages, page_image } => {
-                if self.active_texture.is_none() {
-                    if let Some(img) = page_image.take() {
-                        self.active_texture = Some(ctx.load_texture("pdf_page", img, egui::TextureOptions::LINEAR));
+            FileKind::Pdf { current_page, total_pages, page_images, page_textures } => {
+                // 1. Convert any CPU-side page_images to GPU textures
+                let pending_keys: Vec<usize> = page_images.keys().copied().collect();
+                for p in pending_keys {
+                    if let Some(img) = page_images.remove(&p) {
+                        let tex_name = format!("pdf_page_{p}");
+                        let handle = ctx.load_texture(&tex_name, img, egui::TextureOptions::LINEAR);
+                        page_textures.insert(p, handle);
                     }
                 }
+
+                // 2. Poll background loader responses
+                while let Ok(resp) = self.pdf_loader.response_rx.try_recv() {
+                    if resp.generation == self.pdf_loader.generation {
+                        self.pdf_loader.in_flight.remove(&resp.page);
+                        if let Some(img) = resp.image {
+                            let tex_name = format!("pdf_page_{}", resp.page);
+                            let handle = ctx.load_texture(&tex_name, img, egui::TextureOptions::LINEAR);
+                            page_textures.insert(resp.page, handle);
+                            ctx.request_repaint();
+
+                            // Enforce distance-based LRU eviction: MAX_CACHED_PAGES = 32
+                            const MAX_CACHED_PAGES: usize = 32;
+                            while page_textures.len() > MAX_CACHED_PAGES {
+                                let cur = *current_page;
+                                if let Some((&furthest_page, _)) = page_textures
+                                    .iter()
+                                    .max_by_key(|(&p, _)| (p as isize - cur as isize).abs())
+                                {
+                                    if furthest_page != cur {
+                                        page_textures.remove(&furthest_page);
+                                    } else {
+                                        break;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                        } else {
+                            // Record page as failed to eliminate infinite re-request spin loops
+                            self.pdf_loader.failed.insert(resp.page);
+                            ctx.request_repaint();
+                        }
+                    }
+                }
+
+                // 3. Keep repainting while requests are in flight
+                if !self.pdf_loader.in_flight.is_empty() {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(30));
+                }
+
                 let p = self.current_path.as_deref().unwrap_or(Path::new("document.pdf"));
-                if let Some(new_page) = render_pdf_viewer(
+                render_pdf_viewer(
                     ui,
                     p,
                     current_page,
                     *total_pages,
-                    self.active_texture.as_ref(),
+                    page_textures,
+                    &mut self.pdf_loader,
+                    &mut self.pdf_scroll_target,
                     &mut self.zoom_scale,
                     &mut self.pan_offset,
-                ) {
-                    *page_image = render_pdf_page_to_image(p, new_page);
-                    self.active_texture = None;
-                }
+                );
             }
             FileKind::Media { kind, poster_image } => {
                 if self.active_texture.is_none() {
@@ -931,6 +1244,8 @@ fn render_welcome_viewer(ui: &mut egui::Ui) -> Option<PathBuf> {
 fn render_image_viewer(
     ui: &mut egui::Ui,
     uri: &str,
+    orig_w: u32,
+    orig_h: u32,
     zoom_scale: &mut f32,
     pan_offset: &mut egui::Vec2,
 ) {
@@ -949,14 +1264,32 @@ fn render_image_viewer(
         *zoom_scale = (*zoom_scale * factor).clamp(0.05, 15.0);
     }
 
+    let target_size = if orig_w > 0 && orig_h > 0 {
+        let margin = 24.0_f32;
+        let max_w = (available_size.x - margin * 2.0).max(10.0);
+        let max_h = (available_size.y - margin * 2.0).max(10.0);
+
+        let fit_scale = (max_w / orig_w as f32).min(max_h / orig_h as f32);
+        let base_w = orig_w as f32 * fit_scale;
+        let base_h = orig_h as f32 * fit_scale;
+
+        egui::vec2(base_w * (*zoom_scale), base_h * (*zoom_scale))
+    } else {
+        available_size * (*zoom_scale)
+    };
+
     let center = response.rect.center() + *pan_offset;
-    let target_size = available_size * (*zoom_scale);
-
-    let image = egui::Image::new(uri)
-        .fit_to_exact_size(target_size)
-        .shrink_to_fit();
-
     let image_rect = egui::Rect::from_center_size(center, target_size);
+
+    // Subtle drop shadow behind document sheet
+    let shadow_rect = image_rect.expand(2.5);
+    painter.rect_filled(
+        shadow_rect,
+        egui::Rounding::same(3.0),
+        egui::Color32::from_rgba_premultiplied(0, 0, 0, 30),
+    );
+
+    let image = egui::Image::new(uri).fit_to_exact_size(target_size);
     image.paint_at(ui, image_rect);
 
     // Subtle instructions at the bottom
@@ -1120,31 +1453,673 @@ fn render_spreadsheet_viewer(
         });
 }
 
-fn render_presentation_viewer(
+/// Computes slide canvas dimensions preserving the presentation's native aspect ratio
+/// and calculates a dynamic scaling factor for responsive typography and spacing.
+pub fn compute_presentation_slide_dimensions(
+    available_size: egui::Vec2,
+    aspect_ratio: f32,
+    hud_clearance: f32,
+) -> (f32, f32, f32) {
+    let aspect = if aspect_ratio.is_finite() && aspect_ratio > 0.05 {
+        aspect_ratio.clamp(0.2, 5.0)
+    } else {
+        16.0 / 9.0
+    };
+
+    let hud = if hud_clearance.is_finite() && hud_clearance >= 0.0 {
+        hud_clearance
+    } else {
+        48.0_f32
+    };
+    let avail_x = if available_size.x.is_finite() {
+        available_size.x.max(0.0)
+    } else {
+        0.0
+    };
+    let avail_y = if available_size.y.is_finite() {
+        available_size.y.max(0.0)
+    } else {
+        0.0
+    };
+
+    let pad_x = 28.0_f32;
+    let pad_y = 28.0_f32;
+
+    let usable_w = (avail_x - pad_x * 2.0).max(160.0);
+    let usable_h = (avail_y - pad_y * 2.0 - hud).max(100.0);
+
+    let mut slide_w = usable_w;
+    let mut slide_h = slide_w / aspect;
+
+    if slide_h > usable_h {
+        slide_h = usable_h;
+        slide_w = slide_h * aspect;
+    }
+
+    let min_w = 160.0_f32;
+    let min_h = 90.0_f32;
+    if slide_w < min_w || slide_h < min_h {
+        let scale_w = min_w / slide_w;
+        let scale_h = min_h / slide_h;
+        let boost = scale_w.max(scale_h);
+        slide_w *= boost;
+        slide_h *= boost;
+    }
+
+    let max_w = avail_x;
+    let max_h = avail_y - hud;
+    if max_w >= min_w && max_h >= min_h {
+        if slide_w > max_w {
+            slide_w = max_w;
+            slide_h = slide_w / aspect;
+        }
+        if slide_h > max_h {
+            slide_h = max_h;
+            slide_w = slide_h * aspect;
+        }
+    }
+
+    let scale_factor = (slide_w / 960.0).clamp(0.6, 2.5);
+
+    (slide_w, slide_h, scale_factor)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SlideThemeColors {
+    pub bg: egui::Color32,
+    pub primary_text: egui::Color32,
+    pub secondary_text: egui::Color32,
+    pub muted_text: egui::Color32,
+    pub divider: egui::Color32,
+    pub card_bg: egui::Color32,
+    pub card_border: egui::Color32,
+    pub table_header_bg: egui::Color32,
+    pub table_alt_row_bg: egui::Color32,
+    pub table_border: egui::Color32,
+    pub accent: egui::Color32,
+}
+
+impl SlideThemeColors {
+    pub fn from_background(bg_opt: Option<egui::Color32>) -> Self {
+        let bg = bg_opt.unwrap_or(egui::Color32::from_rgb(255, 255, 255));
+        let lum = 0.299 * (bg.r() as f32) + 0.587 * (bg.g() as f32) + 0.114 * (bg.b() as f32);
+        let is_dark = lum < 128.0;
+
+        let accent = egui::Color32::from_rgb(0, 122, 255);
+
+        if is_dark {
+            Self {
+                bg,
+                primary_text: egui::Color32::from_rgb(245, 245, 247),
+                secondary_text: egui::Color32::from_rgb(175, 175, 185),
+                muted_text: egui::Color32::from_rgb(130, 130, 140),
+                divider: egui::Color32::from_rgb(60, 60, 68),
+                card_bg: egui::Color32::from_rgb(42, 42, 48),
+                card_border: egui::Color32::from_rgb(65, 65, 75),
+                table_header_bg: egui::Color32::from_rgb(48, 48, 56),
+                table_alt_row_bg: egui::Color32::from_rgba_premultiplied(255, 255, 255, 12),
+                table_border: egui::Color32::from_rgb(65, 65, 75),
+                accent,
+            }
+        } else {
+            Self {
+                bg,
+                primary_text: egui::Color32::from_rgb(24, 24, 28),
+                secondary_text: egui::Color32::from_rgb(90, 90, 98),
+                muted_text: egui::Color32::from_rgb(142, 142, 147),
+                divider: egui::Color32::from_rgb(224, 224, 230),
+                card_bg: egui::Color32::from_rgb(248, 249, 252),
+                card_border: egui::Color32::from_rgb(226, 228, 234),
+                table_header_bg: egui::Color32::from_rgb(242, 244, 248),
+                table_alt_row_bg: egui::Color32::from_rgba_premultiplied(0, 0, 0, 7),
+                table_border: egui::Color32::from_rgb(218, 218, 224),
+                accent,
+            }
+        }
+    }
+}
+
+fn render_bullet_item(
     ui: &mut egui::Ui,
-    slides: &[SlideInfo],
-    current_slide: &mut usize,
+    text: &str,
+    bold: bool,
+    level: usize,
+    is_bullet: bool,
+    scale_factor: f32,
+    colors: &SlideThemeColors,
 ) {
-    if slides.is_empty() {
-        ui.centered_and_justified(|ui| {
-            ui.label("Empty presentation");
+    let (indent, glyph, glyph_color, font_size) = match level {
+        0 => (
+            0.0_f32,
+            "•",
+            colors.accent,
+            (15.0 * scale_factor).clamp(10.0, 26.0),
+        ),
+        1 => (
+            24.0 * scale_factor,
+            "–",
+            colors.secondary_text,
+            (14.0 * scale_factor).clamp(9.5, 24.0),
+        ),
+        2 => (
+            48.0 * scale_factor,
+            "▪",
+            colors.muted_text,
+            (13.0 * scale_factor).clamp(9.0, 22.0),
+        ),
+        lvl => (
+            (48.0 + 20.0 * (lvl - 2) as f32) * scale_factor,
+            "▫",
+            colors.muted_text,
+            (12.0 * scale_factor).clamp(8.5, 20.0),
+        ),
+    };
+
+    ui.horizontal(|ui| {
+        if indent > 0.0 {
+            ui.add_space(indent);
+        }
+
+        if is_bullet {
+            let bullet_box_w = 18.0 * scale_factor;
+            let (b_rect, _) = ui.allocate_exact_size(
+                egui::vec2(bullet_box_w, font_size + 2.0),
+                egui::Sense::hover(),
+            );
+            ui.painter().text(
+                b_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                glyph,
+                egui::FontId::proportional(font_size),
+                glyph_color,
+            );
+        }
+
+        let mut rt = egui::RichText::new(text)
+            .size(font_size)
+            .color(colors.primary_text);
+        if bold {
+            rt = rt.strong();
+        }
+        ui.label(rt);
+    });
+}
+
+fn render_card_block(
+    ui: &mut egui::Ui,
+    header: Option<&str>,
+    items: &[String],
+    scale_factor: f32,
+    colors: &SlideThemeColors,
+) {
+    let card_pad_x = 14.0 * scale_factor;
+    let card_pad_y = 10.0 * scale_factor;
+    egui::Frame::none()
+        .rounding(egui::Rounding::same(6.0 * scale_factor))
+        .fill(colors.card_bg)
+        .stroke(egui::Stroke::new(1.0_f32, colors.card_border))
+        .inner_margin(egui::Margin::symmetric(card_pad_x, card_pad_y))
+        .show(ui, |ui| {
+            if let Some(h) = header {
+                ui.label(
+                    egui::RichText::new(h)
+                        .size((14.0 * scale_factor).clamp(10.0, 24.0))
+                        .strong()
+                        .color(colors.primary_text),
+                );
+                ui.add_space(4.0 * scale_factor);
+            }
+            for item in items {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("•")
+                            .size((13.0 * scale_factor).clamp(9.0, 20.0))
+                            .color(colors.accent),
+                    );
+                    ui.add_space(4.0 * scale_factor);
+                    ui.label(
+                        egui::RichText::new(item)
+                            .size((13.0 * scale_factor).clamp(9.0, 20.0))
+                            .color(colors.primary_text),
+                    );
+                });
+            }
         });
+}
+
+fn render_slide_table(
+    ui: &mut egui::Ui,
+    table: &SlideTableData,
+    slide_number: usize,
+    table_index: usize,
+    scale_factor: f32,
+    colors: &SlideThemeColors,
+) {
+    if table.headers.is_empty() && table.rows.is_empty() {
         return;
     }
 
-    let slide_count = slides.len();
-    if *current_slide >= slide_count {
-        *current_slide = 0;
+    ui.add_space(10.0 * scale_factor);
+
+    let cell_pad_x = 12.0 * scale_factor;
+    let cell_pad_y = 6.0 * scale_factor;
+    let header_font_size = (13.5 * scale_factor).clamp(9.5, 22.0);
+    let cell_font_size = (13.0 * scale_factor).clamp(9.0, 20.0);
+
+    egui::Frame::none()
+        .rounding(egui::Rounding::same(6.0 * scale_factor))
+        .stroke(egui::Stroke::new(1.0_f32, colors.table_border))
+        .fill(colors.card_bg)
+        .inner_margin(egui::Margin::symmetric(cell_pad_x, cell_pad_y))
+        .show(ui, |ui| {
+            let grid_id = ui.make_persistent_id(("slide_table_grid", slide_number, table_index));
+            egui::Grid::new(grid_id)
+                .striped(true)
+                .min_col_width(70.0 * scale_factor)
+                .spacing([16.0 * scale_factor, 8.0 * scale_factor])
+                .show(ui, |ui| {
+                    if !table.headers.is_empty() {
+                        for h in &table.headers {
+                            ui.label(
+                                egui::RichText::new(h)
+                                    .size(header_font_size)
+                                    .strong()
+                                    .color(colors.primary_text),
+                            );
+                        }
+                        ui.end_row();
+                    }
+
+                    for row in &table.rows {
+                        for cell in row {
+                            ui.label(
+                                egui::RichText::new(cell)
+                                    .size(cell_font_size)
+                                    .color(colors.primary_text),
+                            );
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
+}
+
+fn render_slide_footer(
+    ui: &mut egui::Ui,
+    slide: &SlideData,
+    scale_factor: f32,
+    colors: &SlideThemeColors,
+    total_slides: usize,
+) {
+    ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+        ui.add_space(4.0 * scale_factor);
+
+        let sep_rect = egui::Rect::from_min_size(
+            ui.cursor().min,
+            egui::vec2(ui.available_width(), 1.0),
+        );
+        ui.painter().rect_filled(
+            sep_rect,
+            0.0,
+            egui::Color32::from_rgba_premultiplied(
+                colors.divider.r(),
+                colors.divider.g(),
+                colors.divider.b(),
+                120,
+            ),
+        );
+        ui.add_space(6.0 * scale_factor);
+
+        ui.horizontal(|ui| {
+            let footer_font_size = (11.0 * scale_factor).clamp(8.0, 16.0);
+
+            if let Some(footer_text) = slide.footers.first() {
+                ui.label(
+                    egui::RichText::new(footer_text)
+                        .size(footer_font_size)
+                        .color(colors.muted_text),
+                );
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new(format!("Slide {} of {}", slide.slide_number, total_slides))
+                        .size(footer_font_size)
+                        .color(colors.muted_text),
+                );
+            });
+        });
+    });
+}
+
+fn render_title_slide_layout(
+    ui: &mut egui::Ui,
+    slide: &SlideData,
+    scale_factor: f32,
+    colors: &SlideThemeColors,
+    _slide_w: f32,
+    slide_h: f32,
+    total_slides: usize,
+) {
+    let top_space = (slide_h * 0.22).max(12.0);
+    ui.add_space(top_space);
+
+    ui.vertical_centered(|ui| {
+        let title_size = (36.0 * scale_factor).clamp(20.0, 64.0);
+        ui.label(
+            egui::RichText::new(&slide.title)
+                .size(title_size)
+                .strong()
+                .color(colors.primary_text),
+        );
+
+        ui.add_space(14.0 * scale_factor);
+        let bar_w = 56.0 * scale_factor;
+        let bar_h = 3.0 * scale_factor;
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(bar_w, bar_h), egui::Sense::hover());
+        ui.painter().rect_filled(rect, egui::Rounding::same(bar_h * 0.5), colors.accent);
+
+        if let Some(subtitle) = &slide.subtitle {
+            ui.add_space(14.0 * scale_factor);
+            let sub_size = (20.0 * scale_factor).clamp(13.0, 36.0);
+            ui.label(
+                egui::RichText::new(subtitle)
+                    .size(sub_size)
+                    .color(colors.secondary_text),
+            );
+        }
+    });
+
+    render_slide_footer(ui, slide, scale_factor, colors, total_slides);
+}
+
+fn render_content_slide_layout(
+    ui: &mut egui::Ui,
+    slide: &SlideData,
+    scale_factor: f32,
+    colors: &SlideThemeColors,
+    _slide_w: f32,
+    _slide_h: f32,
+    total_slides: usize,
+) {
+    let title_size = (24.0 * scale_factor).clamp(16.0, 42.0);
+    ui.label(
+        egui::RichText::new(&slide.title)
+            .size(title_size)
+            .strong()
+            .color(colors.primary_text),
+    );
+
+    ui.add_space(8.0 * scale_factor);
+    let sep_rect = egui::Rect::from_min_size(
+        ui.cursor().min,
+        egui::vec2(ui.available_width(), 1.5 * scale_factor.clamp(0.8, 1.2)),
+    );
+    ui.painter().rect_filled(sep_rect, 0.0, colors.divider);
+    ui.add_space(16.0 * scale_factor);
+
+    let footer_reserve = 32.0 * scale_factor;
+    let body_max_height = (ui.available_height() - footer_reserve).max(40.0);
+
+    egui::ScrollArea::vertical()
+        .id_salt("slide_body_scroll")
+        .max_height(body_max_height)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 8.0 * scale_factor;
+
+            for block in &slide.blocks {
+                match block {
+                    SlideContentBlock::Paragraph { text, bold, level, is_bullet } => {
+                        render_bullet_item(ui, text, *bold, *level, *is_bullet, scale_factor, colors);
+                    }
+                    SlideContentBlock::Card { header, items } => {
+                        render_card_block(ui, header.as_deref(), items, scale_factor, colors);
+                    }
+                }
+            }
+
+            for (table_idx, table) in slide.tables.iter().enumerate() {
+                render_slide_table(ui, table, slide.slide_number, table_idx, scale_factor, colors);
+            }
+        });
+
+    render_slide_footer(ui, slide, scale_factor, colors, total_slides);
+}
+
+fn render_slide_wireframe(painter: &egui::Painter, rect: egui::Rect, slide: &SlideData) {
+    let inner = rect.shrink2(egui::vec2(7.0, 5.0));
+
+    let bg_lum = slide.background_color.map(|c| {
+        0.299 * (c.r() as f32) + 0.587 * (c.g() as f32) + 0.114 * (c.b() as f32)
+    }).unwrap_or(255.0);
+    let is_dark_bg = bg_lum < 128.0;
+
+    let title_color = if is_dark_bg {
+        egui::Color32::from_rgb(240, 240, 245)
+    } else {
+        egui::Color32::from_rgb(32, 32, 38)
+    };
+    let skeleton_line_color = if is_dark_bg {
+        egui::Color32::from_white_alpha(150)
+    } else {
+        egui::Color32::from_rgb(205, 205, 215)
+    };
+    let divider_color = if is_dark_bg {
+        egui::Color32::from_rgb(65, 65, 75)
+    } else {
+        egui::Color32::from_rgb(225, 225, 232)
+    };
+    let bullet_dot_color = egui::Color32::from_rgb(0, 122, 255);
+
+    if slide.is_title_slide {
+        let center = inner.center();
+
+        let title_bar_w = (inner.width() * 0.72).min(80.0);
+        let title_bar_h = 4.5_f32;
+        let title_rect = egui::Rect::from_center_size(
+            center - egui::vec2(0.0, 5.0),
+            egui::vec2(title_bar_w, title_bar_h),
+        );
+        painter.rect_filled(title_rect, egui::Rounding::same(1.5), title_color);
+
+        let sub_bar_w = (inner.width() * 0.46).min(52.0);
+        let sub_bar_h = 2.5_f32;
+        let sub_rect = egui::Rect::from_center_size(
+            center + egui::vec2(0.0, 6.0),
+            egui::vec2(sub_bar_w, sub_bar_h),
+        );
+        painter.rect_filled(sub_rect, egui::Rounding::same(1.0), skeleton_line_color);
+    } else {
+        let mini_title: String = slide.title.chars().take(16).collect();
+        painter.text(
+            inner.min + egui::vec2(0.0, 1.0),
+            egui::Align2::LEFT_TOP,
+            mini_title,
+            egui::FontId::proportional(7.0),
+            title_color,
+        );
+
+        let sep_y = inner.min.y + 11.5;
+        painter.hline(inner.x_range(), sep_y, egui::Stroke::new(0.8_f32, divider_color));
+
+        let body_y = sep_y + 4.0;
+
+        if !slide.tables.is_empty() {
+            let tbl_w = inner.width() - 4.0;
+            let hdr_rect = egui::Rect::from_min_size(
+                egui::pos2(inner.min.x + 2.0, body_y),
+                egui::vec2(tbl_w, 3.5),
+            );
+            painter.rect_filled(hdr_rect, egui::Rounding::same(1.0), title_color);
+
+            for r in 0..2 {
+                let row_y = body_y + 5.5 + (r as f32) * 5.0;
+                if row_y + 3.0 > inner.max.y { break; }
+                let r1 = egui::Rect::from_min_size(
+                    egui::pos2(inner.min.x + 2.0, row_y),
+                    egui::vec2(tbl_w * 0.45, 2.5),
+                );
+                let r2 = egui::Rect::from_min_size(
+                    egui::pos2(inner.min.x + 4.0 + tbl_w * 0.45, row_y),
+                    egui::vec2(tbl_w * 0.45, 2.5),
+                );
+                painter.rect_filled(r1, egui::Rounding::same(0.5), skeleton_line_color);
+                painter.rect_filled(r2, egui::Rounding::same(0.5), skeleton_line_color);
+            }
+        } else {
+            let item_count = slide.blocks.len().clamp(1, 4);
+            for i in 0..item_count {
+                let y = body_y + (i as f32) * 6.5;
+                if y + 3.0 > inner.max.y { break; }
+
+                let (lvl, is_bullet) = match slide.blocks.get(i) {
+                    Some(SlideContentBlock::Paragraph { level, is_bullet, .. }) => (*level, *is_bullet),
+                    _ => (0, true),
+                };
+
+                let indent = (lvl as f32 * 5.0).min(12.0);
+
+                if is_bullet {
+                    let dot_pos = egui::pos2(inner.min.x + indent + 1.5, y + 1.5);
+                    painter.circle_filled(dot_pos, 1.0, bullet_dot_color);
+                }
+
+                let bar_x = inner.min.x + indent + if is_bullet { 5.0 } else { 1.5 };
+                let bar_w = match (slide.slide_number + i) % 3 {
+                    0 => (inner.width() - 22.0 - indent).max(18.0),
+                    1 => (inner.width() - 36.0 - indent).max(14.0),
+                    _ => (inner.width() - 28.0 - indent).max(16.0),
+                };
+
+                let bar_rect = egui::Rect::from_min_size(
+                    egui::pos2(bar_x, y),
+                    egui::vec2(bar_w, 2.2),
+                );
+                painter.rect_filled(bar_rect, egui::Rounding::same(0.8), skeleton_line_color);
+            }
+        }
+    }
+}
+
+pub fn render_presentation_floating_hud(
+    ui: &mut egui::Ui,
+    central_rect: egui::Rect,
+    current_slide: &mut usize,
+    total_slides: usize,
+) {
+    if total_slides <= 1 {
+        return;
     }
 
-    // Left thumbnail strip — proper egui SidePanel so height fills correctly
+    let hud_w = 236.0_f32;
+    let hud_h = 38.0_f32;
+    let hud_pos = egui::pos2(
+        central_rect.center().x - hud_w * 0.5,
+        central_rect.max.y - hud_h - 16.0,
+    );
+    let hud_rect = egui::Rect::from_min_size(hud_pos, egui::vec2(hud_w, hud_h));
+
+    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(hud_rect), |ui| {
+        egui::Frame::none()
+            .fill(egui::Color32::from_black_alpha(190))
+            .rounding(egui::Rounding::same(20.0))
+            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(35)))
+            .shadow(egui::epaint::Shadow {
+                offset: egui::vec2(0.0, 4.0),
+                blur: 16.0,
+                spread: 0.0,
+                color: egui::Color32::from_black_alpha(90),
+            })
+            .inner_margin(egui::Margin::symmetric(12.0, 4.0))
+            .show(ui, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+
+                    let cur = *current_slide;
+
+                    let prev_enabled = cur > 0;
+                    let prev_text_color = if prev_enabled {
+                        egui::Color32::WHITE
+                    } else {
+                        egui::Color32::from_white_alpha(70)
+                    };
+                    let prev_btn = egui::Button::new(
+                        egui::RichText::new("⏴ Prev")
+                            .size(12.5)
+                            .color(prev_text_color),
+                    )
+                    .fill(egui::Color32::TRANSPARENT)
+                    .rounding(egui::Rounding::same(12.0));
+
+                    if ui
+                        .add_enabled(prev_enabled, prev_btn)
+                        .on_hover_text("Previous Slide (Left Arrow / Backspace)")
+                        .clicked()
+                    {
+                        *current_slide = cur.saturating_sub(1);
+                    }
+
+                    ui.painter().vline(
+                        ui.cursor().min.x,
+                        ui.cursor().min.y + 6.0..=ui.cursor().max.y - 6.0,
+                        egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(40)),
+                    );
+                    ui.add_space(4.0);
+
+                    ui.label(
+                        egui::RichText::new(format!("Slide {} of {}", cur + 1, total_slides))
+                            .size(12.5)
+                            .strong()
+                            .color(egui::Color32::from_rgb(225, 225, 230)),
+                    );
+
+                    ui.add_space(4.0);
+                    ui.painter().vline(
+                        ui.cursor().min.x,
+                        ui.cursor().min.y + 6.0..=ui.cursor().max.y - 6.0,
+                        egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(40)),
+                    );
+
+                    let next_enabled = cur + 1 < total_slides;
+                    let next_text_color = if next_enabled {
+                        egui::Color32::WHITE
+                    } else {
+                        egui::Color32::from_white_alpha(70)
+                    };
+                    let next_btn = egui::Button::new(
+                        egui::RichText::new("Next ⏵")
+                            .size(12.5)
+                            .color(next_text_color),
+                    )
+                    .fill(egui::Color32::TRANSPARENT)
+                    .rounding(egui::Rounding::same(12.0));
+
+                    if ui
+                        .add_enabled(next_enabled, next_btn)
+                        .on_hover_text("Next Slide (Right Arrow / Space)")
+                        .clicked()
+                    {
+                        *current_slide = (cur + 1).min(total_slides - 1);
+                    }
+                });
+            });
+    });
+}
+
+pub fn render_presentation_thumbnail_sidebar(
+    ui: &mut egui::Ui,
+    presentation: &PresentationData,
+    current_slide: &mut usize,
+) {
     let current_idx = *current_slide;
+
     egui::SidePanel::left("pptx_thumbs")
         .exact_width(146.0)
         .resizable(false)
         .frame(
             egui::Frame::none()
-                .fill(egui::Color32::from_rgb(20, 20, 22))
+                .fill(egui::Color32::from_rgb(24, 24, 26))
                 .inner_margin(egui::Margin::symmetric(8.0, 10.0)),
         )
         .show_inside(ui, |ui| {
@@ -1152,154 +2127,142 @@ fn render_presentation_viewer(
                 .id_salt("pptx_slide_thumbs")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 8.0;
-                    for (idx, slide) in slides.iter().enumerate() {
+                    ui.spacing_mut().item_spacing.y = 10.0;
+
+                    let card_w = 120.0_f32;
+                    let aspect = if presentation.aspect_ratio.is_finite() && presentation.aspect_ratio > 0.05 {
+                        presentation.aspect_ratio.clamp(0.5, 3.0)
+                    } else {
+                        16.0 / 9.0
+                    };
+                    let card_h = (card_w / aspect).clamp(55.0, 105.0);
+                    let card_size = egui::vec2(card_w, card_h);
+
+                    let last_scrolled_id = ui.make_persistent_id("pptx_last_scrolled_slide");
+                    let last_scrolled: Option<usize> = ui.data_mut(|d| d.get_temp(last_scrolled_id));
+                    let should_scroll_to_active = last_scrolled != Some(current_idx);
+
+                    for (idx, slide) in presentation.slides.iter().enumerate() {
                         let is_selected = idx == current_idx;
-                        // 16:9 thumbnail
-                        let card_size = egui::vec2(122.0, 69.0);
-                        let (rect, response) =
-                            ui.allocate_exact_size(card_size, egui::Sense::click());
-                        if response.clicked() {
-                            *current_slide = idx;
-                        }
 
-                        let painter = ui.painter_at(rect);
-                        let border_color = if is_selected {
-                            egui::Color32::from_rgb(0, 122, 255)
-                        } else if response.hovered() {
-                            egui::Color32::from_rgb(120, 120, 125)
-                        } else {
-                            egui::Color32::from_rgb(55, 55, 60)
-                        };
-                        let border_w = if is_selected { 2.5_f32 } else { 1.0_f32 };
-
-                        painter.rect(
-                            rect,
-                            egui::Rounding::same(3.0),
-                            egui::Color32::WHITE,
-                            egui::Stroke::new(border_w, border_color),
-                        );
-
-                        let mini_title: String = slide.title.chars().take(20).collect();
-                        painter.text(
-                            rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            mini_title,
-                            egui::FontId::proportional(8.0),
-                            egui::Color32::from_rgb(30, 30, 35),
-                        );
-
-                        // slide number below card
                         ui.vertical_centered(|ui| {
+                            let (rect, response) =
+                                ui.allocate_exact_size(card_size, egui::Sense::click());
+
+                            if response.clicked() {
+                                *current_slide = idx;
+                            }
+
+                            if is_selected && should_scroll_to_active {
+                                response.scroll_to_me(Some(egui::Align::Center));
+                                ui.data_mut(|d| d.insert_temp(last_scrolled_id, current_idx));
+                            }
+
+                            let painter = ui.painter_at(rect);
+
+                            let border_color = if is_selected {
+                                egui::Color32::from_rgb(0, 122, 255)
+                            } else if response.hovered() {
+                                egui::Color32::from_rgb(120, 120, 125)
+                            } else {
+                                egui::Color32::from_rgb(55, 55, 60)
+                            };
+                            let border_w = if is_selected { 2.5_f32 } else { 1.0_f32 };
+
+                            let bg_fill = slide.background_color.unwrap_or(egui::Color32::WHITE);
+                            painter.rect_filled(rect, egui::Rounding::same(3.0), bg_fill);
+
+                            render_slide_wireframe(&painter, rect, slide);
+
+                            painter.rect_stroke(
+                                rect,
+                                egui::Rounding::same(3.0),
+                                egui::Stroke::new(border_w, border_color),
+                            );
+
+                            ui.add_space(2.0);
                             ui.label(
                                 egui::RichText::new(format!("{}", idx + 1))
                                     .size(10.0)
                                     .color(if is_selected {
                                         egui::Color32::from_rgb(0, 122, 255)
                                     } else {
-                                        egui::Color32::from_rgb(120, 120, 125)
-                                    }),
+                                        egui::Color32::from_rgb(140, 140, 145)
+                                    })
+                                    .strong(),
                             );
                         });
                     }
                 });
         });
+}
 
-    // Main 16:9 slide canvas
+pub fn render_presentation_viewer(
+    ui: &mut egui::Ui,
+    presentation: &PresentationData,
+    current_slide: &mut usize,
+) {
+    if presentation.slides.is_empty() {
+        ui.centered_and_justified(|ui| {
+            ui.label("Empty presentation");
+        });
+        return;
+    }
+
+    let total_slides = presentation.slides.len();
+    if *current_slide >= total_slides {
+        *current_slide = 0;
+    }
+
+    render_presentation_thumbnail_sidebar(ui, presentation, current_slide);
+
     egui::CentralPanel::default()
         .frame(
             egui::Frame::none()
-                .fill(egui::Color32::from_rgb(38, 38, 42))
+                .fill(egui::Color32::from_rgb(32, 32, 35))
                 .inner_margin(egui::Margin::same(0.0)),
         )
         .show_inside(ui, |ui| {
             let avail = ui.available_size();
-            let pad = 28.0_f32;
-            let mut slide_w = avail.x - pad * 2.0;
-            let mut slide_h = slide_w / (16.0 / 9.0);
-            if slide_h > avail.y - pad * 2.0 {
-                slide_h = (avail.y - pad * 2.0).max(60.0);
-                slide_w = slide_h * (16.0 / 9.0);
-            }
-            slide_w = slide_w.max(100.0);
-            slide_h = slide_h.max(60.0);
+            let central_rect = ui.max_rect();
 
-            let slide = &slides[*current_slide];
+            let (slide_w, slide_h, scale_factor) =
+                compute_presentation_slide_dimensions(avail, presentation.aspect_ratio, 48.0);
+
+            let slide = &presentation.slides[*current_slide];
+            let colors = SlideThemeColors::from_background(slide.background_color);
 
             ui.vertical_centered(|ui| {
-                let v_pad = ((avail.y - slide_h) * 0.5).max(pad);
+                let v_pad = ((avail.y - 48.0 - slide_h) * 0.5).max(16.0);
                 ui.add_space(v_pad);
 
                 egui::Frame::none()
-                    .fill(egui::Color32::WHITE)
+                    .fill(colors.bg)
                     .rounding(egui::Rounding::same(8.0))
-                    .stroke(egui::Stroke::new(
-                        1.0_f32,
-                        egui::Color32::from_rgb(210, 210, 215),
-                    ))
+                    .stroke(egui::Stroke::new(1.0_f32, colors.divider))
                     .shadow(egui::epaint::Shadow {
-                        offset: egui::vec2(0.0, 6.0),
-                        blur: 18.0,
+                        offset: egui::vec2(0.0, (6.0 * scale_factor).clamp(4.0, 14.0)),
+                        blur: (18.0 * scale_factor).clamp(10.0, 32.0),
                         spread: 0.0,
-                        color: egui::Color32::from_black_alpha(60),
+                        color: egui::Color32::from_black_alpha(65),
                     })
-                    .inner_margin(egui::Margin::symmetric(40.0, 32.0))
+                    .inner_margin(egui::Margin::symmetric(
+                        (40.0 * scale_factor).clamp(16.0, 60.0),
+                        (32.0 * scale_factor).clamp(14.0, 48.0),
+                    ))
                     .show(ui, |ui| {
                         ui.set_min_size(egui::vec2(slide_w, slide_h));
                         ui.set_max_size(egui::vec2(slide_w, slide_h));
 
-                        if slide.is_title_slide || slide.bullets.is_empty() {
-                            ui.centered_and_justified(|ui| {
-                                ui.label(
-                                    egui::RichText::new(&slide.title)
-                                        .size(38.0)
-                                        .strong()
-                                        .color(egui::Color32::from_rgb(18, 18, 22)),
-                                );
-                            });
+                        if slide.is_title_slide {
+                            render_title_slide_layout(ui, slide, scale_factor, &colors, slide_w, slide_h, total_slides);
                         } else {
-                            ui.label(
-                                egui::RichText::new(&slide.title)
-                                    .size(24.0)
-                                    .strong()
-                                    .color(egui::Color32::from_rgb(18, 18, 22)),
-                            );
-                            ui.add_space(6.0);
-                            let sep_rect = egui::Rect::from_min_size(
-                                ui.cursor().min,
-                                egui::vec2(ui.available_width(), 1.5),
-                            );
-                            ui.painter().rect_filled(
-                                sep_rect,
-                                0.0,
-                                egui::Color32::from_rgb(220, 220, 228),
-                            );
-                            ui.add_space(16.0);
-
-                            egui::ScrollArea::vertical()
-                                .id_salt("slide_body")
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    for bullet in &slide.bullets {
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                egui::RichText::new("•")
-                                                    .size(15.0)
-                                                    .color(egui::Color32::from_rgb(0, 122, 255)),
-                                            );
-                                            ui.add_space(4.0);
-                                            ui.label(
-                                                egui::RichText::new(bullet)
-                                                    .size(15.0)
-                                                    .color(egui::Color32::from_rgb(36, 36, 42)),
-                                            );
-                                        });
-                                        ui.add_space(6.0);
-                                    }
-                                });
+                            render_content_slide_layout(ui, slide, scale_factor, &colors, slide_w, slide_h, total_slides);
                         }
                     });
             });
+
+            render_presentation_floating_hud(ui, central_rect, current_slide, total_slides);
         });
 }
 
@@ -1426,155 +2389,300 @@ fn render_archive_viewer(
         });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_pdf_viewer(
     ui: &mut egui::Ui,
     path: &Path,
     current_page: &mut usize,
     total_pages: usize,
-    texture: Option<&egui::TextureHandle>,
+    page_textures: &HashMap<usize, egui::TextureHandle>,
+    pdf_loader: &mut PdfLoader,
+    scroll_target: &mut Option<usize>,
     zoom_scale: &mut f32,
-    pan_offset: &mut egui::Vec2,
-) -> Option<usize> {
-    let mut page_change = None;
+    _pan_offset: &mut egui::Vec2,
+) {
+    let total_pages = total_pages.max(1);
+    *current_page = (*current_page).clamp(1, total_pages);
 
-    // Right sidebar — page thumbnails
-    let cur = *current_page;
-    egui::SidePanel::right("pdf_thumbs")
-        .exact_width(110.0)
+    // Trackpad pinch-to-zoom (without hijacking vertical scroll)
+    let zoom_delta = ui.input(|i| i.zoom_delta());
+    if zoom_delta != 1.0 {
+        *zoom_scale = (*zoom_scale * zoom_delta).clamp(0.2, 5.0);
+    }
+
+    // Determine reference aspect ratio from page 1 or first loaded texture, fallback to ISO A4 (595.28 / 841.89)
+    let ref_aspect = page_textures
+        .get(&1)
+        .or_else(|| page_textures.values().next())
+        .map(|t| {
+            let s = t.size_vec2();
+            if s.y > 0.0 {
+                s.x / s.y
+            } else {
+                595.28 / 841.89
+            }
+        })
+        .unwrap_or(595.28 / 841.89);
+
+    // 1. Left sidebar — page thumbnails (macOS Quick Look standard)
+    egui::SidePanel::left("pdf_thumbs")
+        .exact_width(136.0)
         .resizable(false)
         .frame(
             egui::Frame::none()
                 .fill(egui::Color32::from_rgb(20, 20, 22))
-                .inner_margin(egui::Margin::symmetric(8.0, 10.0)),
+                .inner_margin(egui::Margin::symmetric(8.0, 12.0)),
         )
         .show_inside(ui, |ui| {
             egui::ScrollArea::vertical()
-                .id_salt("pdf_page_thumbs")
+                .id_salt("pdf_thumb_scroll")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 8.0;
+                    ui.spacing_mut().item_spacing.y = 10.0;
+
+                    let thumb_w = 100.0_f32;
+                    let thumb_h = (thumb_w / ref_aspect).clamp(65.0, 150.0);
+                    let card_size = egui::vec2(thumb_w, thumb_h);
+
                     for page in 1..=total_pages {
-                        let is_selected = page == cur;
-                        // A4-ish ratio: 86×120
-                        let card_size = egui::vec2(86.0, 118.0);
-                        let (rect, response) =
-                            ui.allocate_exact_size(card_size, egui::Sense::click());
-                        if response.clicked() && page != cur {
-                            *current_page = page;
-                            page_change = Some(page);
-                        }
-
-                        let painter = ui.painter_at(rect);
-                        let border_color = if is_selected {
-                            egui::Color32::from_rgb(0, 122, 255)
-                        } else if response.hovered() {
-                            egui::Color32::from_rgb(120, 120, 125)
-                        } else {
-                            egui::Color32::from_rgb(55, 55, 60)
-                        };
-                        let border_w = if is_selected { 2.5_f32 } else { 1.0_f32 };
-
-                        painter.rect(
-                            rect,
-                            egui::Rounding::same(3.0),
-                            egui::Color32::from_rgb(248, 248, 250),
-                            egui::Stroke::new(border_w, border_color),
-                        );
-
-                        // Miniature text lines
-                        let line_color = egui::Color32::from_rgb(210, 210, 218);
-                        for li in 0..6u32 {
-                            let ly = rect.min.y + 14.0 + (li as f32 * 13.5);
-                            let lw = match li {
-                                0 => 38.0_f32,
-                                5 => 28.0_f32,
-                                _ => 60.0_f32,
-                            };
-                            painter.rect_filled(
-                                egui::Rect::from_min_size(
-                                    egui::pos2(rect.min.x + 10.0, ly),
-                                    egui::vec2(lw, 2.5),
-                                ),
-                                1.0,
-                                line_color,
-                            );
-                        }
+                        let is_selected = page == *current_page;
 
                         ui.vertical_centered(|ui| {
+                            let (rect, response) =
+                                ui.allocate_exact_size(card_size, egui::Sense::click());
+
+                            if response.clicked() {
+                                *current_page = page;
+                                *scroll_target = Some(page);
+                            }
+
+                            // Request texture for thumbnail if missing and nearby / small doc
+                            if !page_textures.contains_key(&page)
+                                && !pdf_loader.failed.contains(&page)
+                                && (total_pages <= 32
+                                    || (page as isize - *current_page as isize).abs() <= 3)
+                            {
+                                pdf_loader.request_page(path, page);
+                            }
+
+                            let painter = ui.painter_at(rect);
+                            let border_color = if is_selected {
+                                egui::Color32::from_rgb(0, 122, 255) // macOS active blue
+                            } else if response.hovered() {
+                                egui::Color32::from_rgb(120, 120, 125)
+                            } else {
+                                egui::Color32::from_rgb(55, 55, 60)
+                            };
+                            let border_w = if is_selected { 2.5_f32 } else { 1.0_f32 };
+
+                            // Pure white paper card base
+                            painter.rect_filled(
+                                rect,
+                                egui::Rounding::same(3.0),
+                                egui::Color32::WHITE,
+                            );
+
+                            // Real page texture or clean numbered placeholder
+                            if let Some(tex) = page_textures.get(&page) {
+                                let img = egui::Image::new(tex)
+                                    .fit_to_exact_size(card_size)
+                                    .rounding(egui::Rounding::same(2.0));
+                                img.paint_at(ui, rect);
+                            } else {
+                                let text_color = if pdf_loader.failed.contains(&page) {
+                                    egui::Color32::from_rgb(220, 80, 80)
+                                } else {
+                                    egui::Color32::from_rgb(170, 170, 180)
+                                };
+                                painter.text(
+                                    rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    format!("{page}"),
+                                    egui::FontId::proportional(14.0),
+                                    text_color,
+                                );
+                            }
+
+                            // Border stroke on top
+                            painter.rect_stroke(
+                                rect,
+                                egui::Rounding::same(3.0),
+                                egui::Stroke::new(border_w, border_color),
+                            );
+
+                            // Page number badge below card
+                            ui.add_space(2.0);
                             ui.label(
                                 egui::RichText::new(format!("{page}"))
                                     .size(10.0)
                                     .color(if is_selected {
                                         egui::Color32::from_rgb(0, 122, 255)
                                     } else {
-                                        egui::Color32::from_rgb(120, 120, 125)
-                                    }),
+                                        egui::Color32::from_rgb(140, 140, 145)
+                                    })
+                                    .strong(),
                             );
                         });
                     }
                 });
         });
 
-    // Central PDF page view
+    // 2. Central continuous multi-page PDF document view
     egui::CentralPanel::default()
         .frame(
             egui::Frame::none()
-                .fill(egui::Color32::from_rgb(56, 56, 60))
+                .fill(egui::Color32::from_rgb(32, 32, 35)) // macOS Quick Look dark canvas
                 .inner_margin(egui::Margin::same(0.0)),
         )
         .show_inside(ui, |ui| {
-            if let Some(tex) = texture {
-                render_texture_interactive(ui, tex, zoom_scale, pan_offset);
-            } else {
-                ui.centered_and_justified(|ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("pdf_continuous_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 20.0;
+                    ui.add_space(20.0); // Top margin
+
+                    // Compute aspect-ratio-preserving page dimensions
+                    let avail_w = ui.available_width();
+                    let avail_h = ui.available_height();
+                    let usable_w = (avail_w - 64.0).max(200.0);
+                    let usable_h = (avail_h - 64.0).max(200.0);
+
+                    // At zoom 1.0, fit height cleanly or fit width, bounded nicely
+                    let fit_h_w = usable_h * ref_aspect;
+                    let base_w = usable_w.min(fit_h_w).clamp(240.0, 900.0);
+
+                    let viewport_rect = ui.clip_rect();
+                    let reading_line_y = viewport_rect.min.y + 80.0;
+                    let mut detected_page = None;
+                    let mut page_1_min_y = 0.0_f32;
+
                     ui.vertical_centered(|ui| {
-                        ui.add_space(40.0);
-                        ui.label(egui::RichText::new("📄").size(64.0));
-                        ui.add_space(16.0);
-                        ui.label(
-                            egui::RichText::new(
-                                path.file_name()
-                                    .and_then(|s| s.to_str())
-                                    .unwrap_or("document.pdf"),
-                            )
-                            .size(20.0)
-                            .strong()
-                            .color(egui::Color32::WHITE),
-                        );
-                        ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "PDF · Page {cur} of {total_pages}"
-                            ))
-                            .color(egui::Color32::from_rgb(160, 160, 168))
-                            .size(13.0),
-                        );
-                        ui.add_space(20.0);
-                        ui.label(
-                            egui::RichText::new(
-                                "Install poppler-utils for page thumbnails:",
-                            )
-                            .color(egui::Color32::from_rgb(120, 120, 125))
-                            .size(12.0),
-                        );
-                        ui.label(
-                            egui::RichText::new(
-                                "sudo apt install poppler-utils",
-                            )
-                            .monospace()
-                            .color(egui::Color32::from_rgb(0, 122, 255))
-                            .size(12.0),
-                        );
-                        ui.add_space(20.0);
-                        if ui.button("Open in Default PDF Viewer").clicked() {
-                            let _ = open::that(path);
+                        for page in 1..=total_pages {
+                            let page_aspect = page_textures
+                                .get(&page)
+                                .map(|t| {
+                                    let s = t.size_vec2();
+                                    if s.y > 0.0 {
+                                        s.x / s.y
+                                    } else {
+                                        ref_aspect
+                                    }
+                                })
+                                .unwrap_or(ref_aspect);
+
+                            let page_w = (base_w * (*zoom_scale)).max(160.0);
+                            let page_h = page_w / page_aspect;
+                            let page_size = egui::vec2(page_w, page_h);
+
+                            let (rect, resp) =
+                                ui.allocate_exact_size(page_size, egui::Sense::hover());
+
+                            if page == 1 {
+                                page_1_min_y = rect.min.y;
+                            }
+
+                            // Detect visible page crossing the top reading line.
+                            // For the final page, when scrolled to the bottom of a multi-page document,
+                            // page_h < viewport_h - 80px prevents rect.min.y from reaching reading_line_y;
+                            // clamp detected_page to total_pages when scrolled to the bottom.
+                            if (rect.min.y <= reading_line_y && rect.max.y > reading_line_y)
+                                || (page == total_pages
+                                    && rect.max.y <= viewport_rect.max.y + 30.0
+                                    && (total_pages == 1 || page_1_min_y < viewport_rect.min.y))
+                            {
+                                detected_page = Some(page);
+                            }
+
+                            // Programmatic scroll-to-page target
+                            if *scroll_target == Some(page) {
+                                resp.scroll_to_me(Some(egui::Align::TOP));
+                            }
+
+                            // Request page rasterization if missing and in or near viewport
+                            let prefetch_margin = (page_h * 1.5).clamp(120.0, 450.0);
+                            if !page_textures.contains_key(&page)
+                                && !pdf_loader.failed.contains(&page)
+                                && (total_pages <= 32
+                                    || rect.intersects(viewport_rect.expand(prefetch_margin))
+                                    || (page as isize - *current_page as isize).abs() <= 2)
+                            {
+                                pdf_loader.request_page(path, page);
+                            }
+
+                            let painter = ui.painter_at(rect);
+
+                            // Drop shadow (macOS floating paper effect)
+                            let shadow_rect = rect.translate(egui::vec2(0.0, 4.0));
+                            painter.rect_filled(
+                                shadow_rect,
+                                egui::Rounding::same(6.0),
+                                egui::Color32::from_black_alpha(45),
+                            );
+
+                            // White page canvas
+                            painter.rect_filled(
+                                rect,
+                                egui::Rounding::same(3.0),
+                                egui::Color32::WHITE,
+                            );
+
+                            // Page texture or loading placeholder
+                            if let Some(tex) = page_textures.get(&page) {
+                                let img = egui::Image::new(tex)
+                                    .fit_to_exact_size(page_size)
+                                    .rounding(egui::Rounding::same(3.0));
+                                img.paint_at(ui, rect);
+                            } else {
+                                let is_failed = pdf_loader.failed.contains(&page);
+                                painter.text(
+                                    rect.center() - egui::vec2(0.0, 16.0),
+                                    egui::Align2::CENTER_CENTER,
+                                    if is_failed { "⚠️" } else { "📄" },
+                                    egui::FontId::proportional(40.0),
+                                    if is_failed {
+                                        egui::Color32::from_rgb(220, 120, 100)
+                                    } else {
+                                        egui::Color32::from_rgb(180, 180, 190)
+                                    },
+                                );
+                                painter.text(
+                                    rect.center() + egui::vec2(0.0, 24.0),
+                                    egui::Align2::CENTER_CENTER,
+                                    if is_failed {
+                                        format!("Page {page} (Render Failed)")
+                                    } else {
+                                        format!("Page {page} of {total_pages}")
+                                    },
+                                    egui::FontId::proportional(14.0),
+                                    if is_failed {
+                                        egui::Color32::from_rgb(180, 90, 80)
+                                    } else {
+                                        egui::Color32::from_rgb(120, 120, 130)
+                                    },
+                                );
+                            }
+
+                            // Crisp 1px boundary border
+                            painter.rect_stroke(
+                                rect,
+                                egui::Rounding::same(3.0),
+                                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(215, 215, 220)),
+                            );
                         }
                     });
-                });
-            }
-        });
 
-    page_change
+                    // Clear programmatic scroll target once applied
+                    if scroll_target.is_some() {
+                        *scroll_target = None;
+                    } else if let Some(p) = detected_page {
+                        // Update current_page based on user scroll position
+                        *current_page = p;
+                    }
+
+                    ui.add_space(40.0); // Bottom margin
+                });
+        });
 }
 
 pub struct MediaPlayer {
@@ -1621,8 +2729,40 @@ impl MediaPlayer {
         player
     }
 
+    pub fn check_eof_and_reap(&mut self) -> bool {
+        if !self.is_playing {
+            return false;
+        }
+
+        let mut stream_ended = false;
+        if self.is_video {
+            if let Some(child) = &mut self.video_child {
+                if let Ok(Some(_status)) = child.try_wait() {
+                    stream_ended = true;
+                }
+            }
+        } else {
+            if let Some(child) = &mut self.audio_child {
+                if let Ok(Some(_status)) = child.try_wait() {
+                    stream_ended = true;
+                }
+            }
+        }
+
+        if stream_ended {
+            self.current_time = self.duration;
+            self.pause_playback();
+            return true;
+        }
+
+        false
+    }
+
     pub fn start_playback(&mut self) {
         self.stop_processes();
+        if self.duration > 0.0 && self.current_time >= self.duration {
+            self.current_time = 0.0;
+        }
         self.is_playing = true;
         self.last_tick = Instant::now();
 
@@ -1647,7 +2787,7 @@ impl MediaPlayer {
         if self.is_playing {
             self.pause_playback();
         } else {
-            if self.current_time >= self.duration {
+            if self.duration > 0.0 && self.current_time >= self.duration {
                 self.current_time = 0.0;
             }
             self.start_playback();
@@ -1656,6 +2796,10 @@ impl MediaPlayer {
 
     pub fn seek(&mut self, new_time: f64) {
         self.current_time = new_time.clamp(0.0, self.duration);
+        if self.duration > 0.0 && self.current_time >= self.duration {
+            self.pause_playback();
+            return;
+        }
         if self.is_playing {
             self.start_playback();
         }
@@ -1862,8 +3006,10 @@ fn render_audio_player(
                     egui::Slider::new(&mut slider_val, 0.0..=player.duration.max(1.0))
                         .show_value(false),
                 );
-                if slider_resp.changed() {
+                if slider_resp.drag_stopped() || (slider_resp.clicked() && !slider_resp.dragged()) {
                     seek_to = Some(slider_val);
+                } else if slider_resp.dragged() {
+                    player.current_time = slider_val;
                 }
 
                 ui.label(
@@ -1977,10 +3123,16 @@ fn render_media_player(
 
     // Floating macOS Glass HUD at Bottom
     egui::Frame::canvas(ui.style())
-        .fill(egui::Color32::from_black_alpha(220))
-        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(50, 50, 60)))
-        .rounding(egui::Rounding::same(8.0))
-        .inner_margin(egui::Margin::symmetric(14.0, 8.0))
+        .fill(egui::Color32::from_black_alpha(190))
+        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(35)))
+        .rounding(egui::Rounding::same(20.0))
+        .shadow(egui::epaint::Shadow {
+            offset: egui::vec2(0.0, 4.0),
+            blur: 16.0,
+            spread: 0.0,
+            color: egui::Color32::from_black_alpha(80),
+        })
+        .inner_margin(egui::Margin::symmetric(16.0, 8.0))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 // Rewind 15
@@ -2013,14 +3165,17 @@ fn render_media_player(
 
                 // Scrubber Slider
                 let mut slider_val = player.current_time;
+                let slider_width = calculate_scrubber_width(ui.available_width());
                 let slider_resp = ui.add_sized(
-                    [ui.available_width() - 210.0, 18.0],
+                    [slider_width, 18.0],
                     egui::Slider::new(&mut slider_val, 0.0..=player.duration.max(1.0))
                         .show_value(false),
                 );
 
-                if slider_resp.changed() {
+                if slider_resp.drag_stopped() || (slider_resp.clicked() && !slider_resp.dragged()) {
                     seek_to = Some(slider_val);
+                } else if slider_resp.dragged() {
+                    player.current_time = slider_val;
                 }
 
                 // Time Total
@@ -2173,6 +3328,11 @@ fn calculate_target_dims(orig_w: u32, orig_h: u32, max_w: u32, max_h: u32) -> (u
     (w.max(320), h.max(180))
 }
 
+/// Calculates scrubber slider width for media player, protecting against layout underflow.
+pub fn calculate_scrubber_width(available_width: f32) -> f32 {
+    (available_width - 210.0).max(60.0)
+}
+
 fn format_time(seconds: f64) -> String {
     let total_secs = seconds.max(0.0) as u64;
     let mins = total_secs / 60;
@@ -2184,6 +3344,7 @@ fn probe_media_info(path: &Path) -> (f64, (u32, u32), Option<AudioMetadata>) {
     let mut duration = 0.0;
     let mut dims = (854, 480);
     let mut meta = AudioMetadata::default();
+    let mut bit_rate = 0.0_f64;
     let path_str = match path.to_str() {
         Some(s) => s,
         None => return (duration, dims, None),
@@ -2192,7 +3353,7 @@ fn probe_media_info(path: &Path) -> (f64, (u32, u32), Option<AudioMetadata>) {
     if let Ok(out) = Command::new("ffprobe")
         .args([
             "-v", "error",
-            "-show_entries", "format_tags=title,artist,album:format=duration",
+            "-show_entries", "format_tags=title,artist,album:format=duration,bit_rate:stream=duration",
             "-of", "default=noprint_wrappers=1",
             path_str,
         ])
@@ -2204,8 +3365,14 @@ fn probe_media_info(path: &Path) -> (f64, (u32, u32), Option<AudioMetadata>) {
                 let trimmed = line.trim();
                 if let Some(val) = trimmed.strip_prefix("duration=") {
                     if let Ok(d) = val.parse::<f64>() {
-                        duration = d;
-                        meta.duration = d;
+                        if d > duration {
+                            duration = d;
+                            meta.duration = d;
+                        }
+                    }
+                } else if let Some(val) = trimmed.strip_prefix("bit_rate=") {
+                    if let Ok(b) = val.parse::<f64>() {
+                        bit_rate = b;
                     }
                 } else if let Some(val) = trimmed.strip_prefix("TAG:title=") {
                     meta.title = val.to_string();
@@ -2214,6 +3381,16 @@ fn probe_media_info(path: &Path) -> (f64, (u32, u32), Option<AudioMetadata>) {
                 } else if let Some(val) = trimmed.strip_prefix("TAG:album=") {
                     meta.album = val.to_string();
                 }
+            }
+        }
+    }
+
+    if bit_rate > 0.0 {
+        if let Ok(m) = fs::metadata(path) {
+            let estimated_dur = (m.len() as f64 * 8.0) / bit_rate;
+            if estimated_dur > duration * 1.5 {
+                duration = estimated_dur;
+                meta.duration = estimated_dur;
             }
         }
     }
@@ -2355,14 +3532,33 @@ fn render_texture_interactive(
         *zoom_scale = (*zoom_scale * factor).clamp(0.05, 15.0);
     }
 
+    let tex_size = texture.size_vec2();
+    let target_size = if tex_size.x > 0.0 && tex_size.y > 0.0 {
+        let margin = 24.0_f32;
+        let max_w = (available_size.x - margin * 2.0).max(10.0);
+        let max_h = (available_size.y - margin * 2.0).max(10.0);
+
+        let fit_scale = (max_w / tex_size.x).min(max_h / tex_size.y);
+        let base_w = tex_size.x * fit_scale;
+        let base_h = tex_size.y * fit_scale;
+
+        egui::vec2(base_w * (*zoom_scale), base_h * (*zoom_scale))
+    } else {
+        available_size * (*zoom_scale)
+    };
+
     let center = response.rect.center() + *pan_offset;
-    let target_size = available_size * (*zoom_scale);
-
-    let image = egui::Image::new(texture)
-        .fit_to_exact_size(target_size)
-        .shrink_to_fit();
-
     let image_rect = egui::Rect::from_center_size(center, target_size);
+
+    // Subtle drop shadow behind document sheet
+    let shadow_rect = image_rect.expand(2.5);
+    painter.rect_filled(
+        shadow_rect,
+        egui::Rounding::same(3.0),
+        egui::Color32::from_rgba_premultiplied(0, 0, 0, 30),
+    );
+
+    let image = egui::Image::new(texture).fit_to_exact_size(target_size);
     image.paint_at(ui, image_rect);
 
     painter.text(
@@ -2564,34 +3760,72 @@ fn load_zip_listing(path: &Path, file_size: u64) -> FileKind {
     }
 }
 
-fn estimate_pdf_pages(path: &Path) -> Option<usize> {
-    let mut file = File::open(path).ok()?;
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer).ok()?;
-
+pub fn estimate_pdf_pages_from_bytes(buffer: &[u8]) -> Option<usize> {
     let mut count = 0;
-    let target = b"/Type /Page";
-    let target_alt = b"/Type/Page";
+    let is_page_terminator = |b: u8| -> bool {
+        b.is_ascii_whitespace() || matches!(b, b'/' | b'>' | b']' | b'<' | b'[' | b'(' | b')' | b'%' | b';')
+    };
 
-    for window in buffer.windows(target.len()) {
-        if window == target {
-            count += 1;
-        }
-    }
-
-    if count == 0 {
-        for window in buffer.windows(target_alt.len()) {
-            if window == target_alt {
-                count += 1;
+    let mut i = 0;
+    while i + 5 <= buffer.len() {
+        if &buffer[i..i + 5] == b"/Type" {
+            let mut j = i + 5;
+            while j < buffer.len() && buffer[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j + 5 <= buffer.len() && &buffer[j..j + 5] == b"/Page" {
+                let next_idx = j + 5;
+                if next_idx >= buffer.len() || is_page_terminator(buffer[next_idx]) {
+                    count += 1;
+                    i = next_idx;
+                    continue;
+                }
             }
         }
+        i += 1;
     }
 
     if count > 0 {
         Some(count)
     } else {
-        None
+        // Fallback: search for /Count <num> in /Type /Pages
+        let count_target = b"/Count";
+        let mut max_count = 0;
+        let mut idx = 0;
+        while idx + count_target.len() < buffer.len() {
+            if &buffer[idx..idx + count_target.len()] == count_target {
+                let mut k = idx + count_target.len();
+                while k < buffer.len() && buffer[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                let mut num_str = String::new();
+                while k < buffer.len() && buffer[k].is_ascii_digit() {
+                    num_str.push(buffer[k] as char);
+                    k += 1;
+                }
+                if let Ok(c) = num_str.parse::<usize>() {
+                    if c > max_count {
+                        max_count = c;
+                    }
+                }
+                idx = k;
+            } else {
+                idx += 1;
+            }
+        }
+        if max_count > 0 {
+            Some(max_count)
+        } else {
+            None
+        }
     }
+}
+
+pub fn estimate_pdf_pages(path: &Path) -> Option<usize> {
+    let mut file = File::open(path).ok()?;
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer).ok()?;
+    estimate_pdf_pages_from_bytes(&buffer)
 }
 
 fn detect_language(ext: &str, sample_text: &str) -> String {
@@ -2695,28 +3929,26 @@ fn read_zip_entry(path: &Path, filter: impl Fn(&str) -> bool) -> Vec<(String, Ve
                     let name = String::from_utf8_lossy(&name_buf).to_string();
                     cd_cursor += 46 + (name_len as u64) + (extra_len as u64) + (comment_len as u64);
 
-                    if filter(&name) {
-                        if file.seek(SeekFrom::Start(local_hdr_offset)).is_ok() {
-                            let mut local_hdr = [0u8; 30];
-                            if file.read_exact(&mut local_hdr).is_ok() && local_hdr[0..4] == [0x50, 0x4b, 0x03, 0x04] {
-                                let local_name_len = u16::from_le_bytes(local_hdr[26..28].try_into().unwrap()) as u64;
-                                let local_extra_len = u16::from_le_bytes(local_hdr[28..30].try_into().unwrap()) as u64;
-                                let data_offset = local_hdr_offset + 30 + local_name_len + local_extra_len;
+                    if filter(&name) && file.seek(SeekFrom::Start(local_hdr_offset)).is_ok() {
+                        let mut local_hdr = [0u8; 30];
+                        if file.read_exact(&mut local_hdr).is_ok() && local_hdr[0..4] == [0x50, 0x4b, 0x03, 0x04] {
+                            let local_name_len = u16::from_le_bytes(local_hdr[26..28].try_into().unwrap()) as u64;
+                            let local_extra_len = u16::from_le_bytes(local_hdr[28..30].try_into().unwrap()) as u64;
+                            let data_offset = local_hdr_offset + 30 + local_name_len + local_extra_len;
 
-                                if file.seek(SeekFrom::Start(data_offset)).is_ok() {
-                                    let mut comp_data = vec![0u8; comp_size];
-                                    if file.read_exact(&mut comp_data).is_ok() {
-                                        let decompressed = if method == 0 {
-                                            Some(comp_data)
-                                        } else if method == 8 {
-                                            miniz_oxide::inflate::decompress_to_vec(&comp_data).ok()
-                                        } else {
-                                            None
-                                        };
+                            if file.seek(SeekFrom::Start(data_offset)).is_ok() {
+                                let mut comp_data = vec![0u8; comp_size];
+                                if file.read_exact(&mut comp_data).is_ok() {
+                                    let decompressed = if method == 0 {
+                                        Some(comp_data)
+                                    } else if method == 8 {
+                                        miniz_oxide::inflate::decompress_to_vec(&comp_data).ok()
+                                    } else {
+                                        None
+                                    };
 
-                                        if let Some(data) = decompressed {
-                                            results.push((name, data));
-                                        }
+                                    if let Some(data) = decompressed {
+                                        results.push((name, data));
                                     }
                                 }
                             }
@@ -2761,20 +3993,18 @@ fn read_zip_entry(path: &Path, filter: impl Fn(&str) -> bool) -> Vec<(String, Ve
         let name = String::from_utf8_lossy(&name_bytes).to_string();
         let data_offset = offset + 30 + (name_len as u64) + (extra_len as u64);
 
-        if filter(&name) && comp_size > 0 {
-            if file.seek(SeekFrom::Start(data_offset)).is_ok() {
-                let mut comp_data = vec![0u8; comp_size];
-                if file.read_exact(&mut comp_data).is_ok() {
-                    let decompressed = if method == 0 {
-                        Some(comp_data)
-                    } else if method == 8 {
-                        miniz_oxide::inflate::decompress_to_vec(&comp_data).ok()
-                    } else {
-                        None
-                    };
-                    if let Some(data) = decompressed {
-                        results.push((name, data));
-                    }
+        if filter(&name) && comp_size > 0 && file.seek(SeekFrom::Start(data_offset)).is_ok() {
+            let mut comp_data = vec![0u8; comp_size];
+            if file.read_exact(&mut comp_data).is_ok() {
+                let decompressed = if method == 0 {
+                    Some(comp_data)
+                } else if method == 8 {
+                    miniz_oxide::inflate::decompress_to_vec(&comp_data).ok()
+                } else {
+                    None
+                };
+                if let Some(data) = decompressed {
+                    results.push((name, data));
                 }
             }
         }
@@ -2788,70 +4018,567 @@ fn read_zip_entry(path: &Path, filter: impl Fn(&str) -> bool) -> Vec<(String, Ve
     results
 }
 
-fn load_pptx(path: &Path) -> FileKind {
-    let entries = read_zip_entry(path, |name| {
-        (name.starts_with("ppt/slides/slide") && name.ends_with(".xml") && !name.contains("Layout") && !name.contains("Master") && !name.contains("_rels"))
-            || name == "content.xml"
-    });
+/// Extracts the value of an attribute `attr_name` from an XML tag string.
+/// Supports both double and single quotes.
+pub fn extract_xml_attr(tag: &str, attr_name: &str) -> Option<String> {
+    for quote in ['"', '\''] {
+        let pattern = format!("{attr_name}={quote}");
+        if let Some(pos) = tag.find(&pattern) {
+            let val_start = pos + pattern.len();
+            if let Some(val_len) = tag[val_start..].find(quote) {
+                return Some(decode_xml_entities(&tag[val_start..val_start + val_len]));
+            }
+        }
+    }
+    None
+}
 
-    let mut slides_data = Vec::new();
-    for (name, data) in entries {
-        if (name.starts_with("ppt/slides/slide") && name.ends_with(".xml")) || name == "content.xml" {
-            slides_data.push((name, data));
+/// Safely extracts an XML tag starting at `slice`, finding its closing delimiter (`/>` or `>`).
+/// Returns `Some((tag_slice, tag_len))` where `tag_len` is the byte length to advance the cursor.
+pub fn parse_xml_tag(slice: &str) -> Option<(&str, usize)> {
+    let gt = slice.find('>')?;
+    Some((&slice[..=gt], gt + 1))
+}
+
+/// Parses presentation dimensions (cx, cy) and slide relationship IDs from `ppt/presentation.xml`.
+pub fn parse_presentation_xml(xml: &str) -> (f32, Vec<String>) {
+    let mut aspect_ratio = 16.0 / 9.0;
+
+    if let Some(pos) = xml.find("<p:sldSz").or_else(|| xml.find("<sldSz")) {
+        if let Some((tag, _)) = parse_xml_tag(&xml[pos..]) {
+            let cx_opt = extract_xml_attr(tag, "cx").and_then(|v| v.parse::<u64>().ok());
+            let cy_opt = extract_xml_attr(tag, "cy").and_then(|v| v.parse::<u64>().ok());
+
+            if let (Some(cx), Some(cy)) = (cx_opt, cy_opt) {
+                if cy > 0 && cx > 0 {
+                    aspect_ratio = (cx as f32 / cy as f32).clamp(0.2, 5.0);
+                }
+            }
         }
     }
 
-    slides_data.sort_by_key(|(name, _)| {
-        name.chars()
-            .filter(|c| c.is_ascii_digit())
-            .collect::<String>()
-            .parse::<usize>()
-            .unwrap_or(0)
-    });
+    let mut slide_rids = Vec::new();
+    let mut cursor = 0;
+    while let Some(pos) = xml[cursor..].find("<p:sldId").or_else(|| xml[cursor..].find("<sldId")) {
+        let abs_pos = cursor + pos;
+        let Some((tag, tag_len)) = parse_xml_tag(&xml[abs_pos..]) else {
+            break;
+        };
+        if let Some(rid) = extract_xml_attr(tag, "r:id").or_else(|| extract_xml_attr(tag, "id")) {
+            slide_rids.push(rid);
+        }
+        cursor = abs_pos + tag_len;
+    }
 
-    let mut slides = Vec::new();
-    for (idx, (_, data)) in slides_data.into_iter().enumerate() {
-        if let Ok(xml) = std::str::from_utf8(&data) {
-            let mut paras = extract_xml_paragraphs(xml);
-            if paras.is_empty() {
-                let tags = extract_xml_tags(xml, "a:t");
-                if !tags.is_empty() {
-                    paras = tags;
+    (aspect_ratio, slide_rids)
+}
+
+/// Parses relationship mappings from `ppt/_rels/presentation.xml.rels`.
+pub fn parse_presentation_rels_xml(xml: &str) -> HashMap<String, String> {
+    let mut rid_map = HashMap::new();
+    let mut cursor = 0;
+
+    while let Some(pos) = xml[cursor..].find("<Relationship") {
+        let abs_pos = cursor + pos;
+        let Some((tag, tag_len)) = parse_xml_tag(&xml[abs_pos..]) else {
+            break;
+        };
+
+        if let (Some(id), Some(target)) = (extract_xml_attr(tag, "Id"), extract_xml_attr(tag, "Target")) {
+            let clean_target = target.trim_start_matches('/');
+            let normalized_path = if clean_target.starts_with("ppt/") {
+                clean_target.to_string()
+            } else {
+                format!("ppt/{clean_target}")
+            };
+            rid_map.insert(id, normalized_path);
+        }
+
+        cursor = abs_pos + tag_len;
+    }
+
+    rid_map
+}
+
+/// Extracts text runs and bold formatting from within a paragraph `<a:p>`.
+pub fn extract_paragraph_runs(para_xml: &str) -> Vec<(String, bool)> {
+    let mut runs = Vec::new();
+    let mut cursor = 0;
+
+    while let Some(r_pos) = para_xml[cursor..].find("<a:r") {
+        let abs_r_pos = cursor + r_pos;
+        if let Some(r_end) = para_xml[abs_r_pos..].find("</a:r>") {
+            let r_body = &para_xml[abs_r_pos..abs_r_pos + r_end];
+            let bold = r_body.contains("b=\"1\"") || r_body.contains("b=\"true\"");
+
+            let mut t_cursor = 0;
+            while let Some(t_open) = r_body[t_cursor..].find("<a:t") {
+                let abs_t_open = t_cursor + t_open;
+                if let Some(tag_close) = r_body[abs_t_open..].find('>') {
+                    let content_start = abs_t_open + tag_close + 1;
+                    if let Some(t_end) = r_body[content_start..].find("</a:t>") {
+                        let text = decode_xml_entities(&r_body[content_start..content_start + t_end]);
+                        if !text.is_empty() {
+                            runs.push((text, bold));
+                        }
+                        t_cursor = content_start + t_end + 6;
+                        continue;
+                    }
+                }
+                break;
+            }
+            cursor = abs_r_pos + r_end + 6;
+        } else {
+            break;
+        }
+    }
+
+    let mut fld_cursor = 0;
+    while let Some(f_pos) = para_xml[fld_cursor..].find("<a:fld") {
+        let abs_f_pos = fld_cursor + f_pos;
+        if let Some(f_end) = para_xml[abs_f_pos..].find("</a:fld>") {
+            let f_body = &para_xml[abs_f_pos..abs_f_pos + f_end];
+            let mut t_cursor = 0;
+            while let Some(t_open) = f_body[t_cursor..].find("<a:t") {
+                let abs_t_open = t_cursor + t_open;
+                if let Some(tag_close) = f_body[abs_t_open..].find('>') {
+                    let content_start = abs_t_open + tag_close + 1;
+                    if let Some(t_end) = f_body[content_start..].find("</a:t>") {
+                        let text = decode_xml_entities(&f_body[content_start..content_start + t_end]);
+                        if !text.is_empty() {
+                            runs.push((text, false));
+                        }
+                        t_cursor = content_start + t_end + 6;
+                        continue;
+                    }
+                }
+                break;
+            }
+            fld_cursor = abs_f_pos + f_end + 8;
+        } else {
+            break;
+        }
+    }
+
+    if runs.is_empty() {
+        let tags = extract_xml_tags(para_xml, "a:t");
+        for t in tags {
+            if !t.is_empty() {
+                runs.push((t, false));
+            }
+        }
+    }
+
+    runs
+}
+
+/// Represents an XML element slice located within an XML string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XmlElement<'a> {
+    pub body: &'a str,
+    pub is_self_closing: bool,
+    pub next_cursor: usize,
+}
+
+/// Robustly scans `xml` starting from `cursor` for an XML element matching `open_prefix`
+/// and closing with `close_tag`.
+///
+/// Features:
+/// 1. Tag name boundary validation: verifies that the byte immediately following `open_prefix`
+///    is one of `>`, `/`, or ASCII whitespace (` `, `\t`, `\r`, `\n`). This prevents false prefix
+///    collisions (e.g., `<p:spTree>` matching `<p:sp>`, or `<a:pPr>` matching `<a:p>`).
+/// 2. Self-closing tag detection: detects `<tag/>` and `<tag .../>` (with or without whitespace
+///    before `/`), returning `is_self_closing = true` and setting `next_cursor` past `>`.
+/// 3. Paired tag scanning: for open tags, searches for `close_tag` strictly starting *after* the
+///    opening tag header `>`.
+/// 4. Loop continuation on malformed XML: if an open tag is never closed, advances past the opening
+///    tag header to avoid infinite loops and avoid dropping subsequent sibling tags.
+pub fn find_xml_element<'a>(
+    xml: &'a str,
+    mut cursor: usize,
+    open_prefix: &str,
+    close_tag: &str,
+) -> Option<XmlElement<'a>> {
+    while let Some(rel_pos) = xml[cursor..].find(open_prefix) {
+        let abs_open = cursor + rel_pos;
+        let after_tag = abs_open + open_prefix.len();
+
+        if let Some(&b) = xml.as_bytes().get(after_tag) {
+            if b != b'>' && b != b'/' && !b.is_ascii_whitespace() {
+                cursor = after_tag;
+                continue;
+            }
+        }
+
+        let gt_rel = xml[abs_open..].find('>')?;
+        let open_tag_end = abs_open + gt_rel + 1;
+        let open_tag = &xml[abs_open..open_tag_end];
+        let is_self_closing = open_tag.ends_with("/>")
+            || (gt_rel > 0 && open_tag[..open_tag.len() - 1].trim_end().ends_with('/'));
+
+        if is_self_closing {
+            return Some(XmlElement {
+                body: open_tag,
+                is_self_closing: true,
+                next_cursor: open_tag_end,
+            });
+        }
+
+        if let Some(close_rel) = xml[open_tag_end..].find(close_tag) {
+            let abs_close = open_tag_end + close_rel;
+            let next_cursor = abs_close + close_tag.len();
+            return Some(XmlElement {
+                body: &xml[abs_open..abs_close],
+                is_self_closing: false,
+                next_cursor,
+            });
+        } else {
+            cursor = open_tag_end;
+        }
+    }
+
+    None
+}
+
+/// Robustly parses individual slide XML `ppt/slides/slide*.xml`.
+pub fn parse_slide_xml(xml: &str, slide_number: usize) -> SlideData {
+    // 1. Slide Background Color
+    let mut background_color = None;
+    if let Some(bg_pos) = xml.find("<p:bg").or_else(|| xml.find("<bg")) {
+        if let Some(bg_end) = xml[bg_pos..].find("</p:bg>").or_else(|| xml[bg_pos..].find("</bg>")) {
+            let bg_body = &xml[bg_pos..bg_pos + bg_end];
+            if let Some(clr_pos) = bg_body.find("<a:srgbClr").or_else(|| bg_body.find("<srgbClr")) {
+                if let Some((clr_tag, _)) = parse_xml_tag(&bg_body[clr_pos..]) {
+                    if let Some(val) = extract_xml_attr(clr_tag, "val") {
+                        if val.len() == 6 {
+                            if let (Ok(r), Ok(g), Ok(b)) = (
+                                u8::from_str_radix(&val[0..2], 16),
+                                u8::from_str_radix(&val[2..4], 16),
+                                u8::from_str_radix(&val[4..6], 16),
+                            ) {
+                                background_color = Some(egui::Color32::from_rgb(r, g, b));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut title_parts = Vec::new();
+    let mut subtitle = None;
+    let mut footers = Vec::new();
+    let mut blocks = Vec::new();
+    let mut tables = Vec::new();
+    let mut has_ctr_title = false;
+
+    // 2. Iterate Shapes `<p:sp>`
+    let mut cursor = 0;
+    while let Some(elem) = find_xml_element(xml, cursor, "<p:sp", "</p:sp>") {
+        cursor = elem.next_cursor;
+        if elem.is_self_closing {
+            continue;
+        }
+        let sp_body = elem.body;
+
+        // Check Placeholder type
+        let mut ph_type = None;
+        if let Some(ph_pos) = sp_body.find("<p:ph") {
+            if let Some((ph_tag, _)) = parse_xml_tag(&sp_body[ph_pos..]) {
+                ph_type = extract_xml_attr(ph_tag, "type");
+                if ph_type.is_none() {
+                    ph_type = Some("body".to_string());
+                }
+            }
+        }
+
+        if ph_type.as_deref() == Some("ctrTitle") {
+            has_ctr_title = true;
+        }
+
+        // Extract paragraphs from <p:txBody>
+        let mut p_cursor = 0;
+        let mut shape_paragraphs = Vec::new();
+
+        while let Some(p_elem) = find_xml_element(sp_body, p_cursor, "<a:p", "</a:p>") {
+            p_cursor = p_elem.next_cursor;
+            if p_elem.is_self_closing {
+                continue;
+            }
+            let p_body = p_elem.body;
+
+            // Paragraph properties (level & bullet style)
+            let mut level = 0_usize;
+            let mut is_bullet = true;
+
+            if let Some(ppr_pos) = p_body.find("<a:pPr") {
+                if let Some((ppr_tag, _)) = parse_xml_tag(&p_body[ppr_pos..]) {
+                    if let Some(lvl_str) = extract_xml_attr(ppr_tag, "lvl") {
+                        level = lvl_str.parse::<usize>().unwrap_or(0);
+                    }
+                    if p_body.contains("<a:buNone") {
+                        is_bullet = false;
+                    }
                 }
             }
 
-            if !paras.is_empty() {
-                let title = paras[0].clone();
-                let bullets = paras[1..].to_vec();
-                let is_title_slide = idx == 0 || bullets.is_empty();
-                slides.push(SlideInfo {
-                    slide_number: idx + 1,
-                    title,
-                    bullets,
-                    is_title_slide,
-                });
+            let runs = extract_paragraph_runs(p_body);
+            let full_text = runs.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>().join("").trim().to_string();
+            let bold = runs.iter().any(|(_, b)| *b);
+
+            if !full_text.is_empty() {
+                shape_paragraphs.push((full_text, bold, level, is_bullet));
+            }
+        }
+
+        if shape_paragraphs.is_empty() {
+            continue;
+        }
+
+        match ph_type.as_deref() {
+            Some("ctrTitle") | Some("title") => {
+                for (text, _, _, _) in shape_paragraphs {
+                    title_parts.push(text);
+                }
+            }
+            Some("subTitle") => {
+                let sub = shape_paragraphs.into_iter().map(|(t, _, _, _)| t).collect::<Vec<_>>().join("\n");
+                if subtitle.is_none() {
+                    subtitle = Some(sub);
+                }
+            }
+            Some("ftr") | Some("dt") | Some("sldNum") => {
+                for (text, _, _, _) in shape_paragraphs {
+                    footers.push(text);
+                }
+            }
+            _ => {
+                for (text, bold, level, is_bullet) in shape_paragraphs {
+                    blocks.push(SlideContentBlock::Paragraph {
+                        text,
+                        bold,
+                        level,
+                        is_bullet,
+                    });
+                }
+            }
+        }
+    }
+
+    // 3. Iterate Graphic Frames `<p:graphicFrame>` for Tables `<a:tbl>`
+    let mut gf_cursor = 0;
+    while let Some(gf_elem) = find_xml_element(xml, gf_cursor, "<p:graphicFrame", "</p:graphicFrame>") {
+        gf_cursor = gf_elem.next_cursor;
+        if gf_elem.is_self_closing {
+            continue;
+        }
+        let gf_body = gf_elem.body;
+
+        if gf_body.contains("<a:tbl") {
+            let mut tr_cursor = 0;
+            let mut all_rows = Vec::new();
+
+            while let Some(tr_elem) = find_xml_element(gf_body, tr_cursor, "<a:tr", "</a:tr>") {
+                tr_cursor = tr_elem.next_cursor;
+                if tr_elem.is_self_closing {
+                    continue;
+                }
+                let tr_body = tr_elem.body;
+
+                let mut tc_cursor = 0;
+                let mut row_cells = Vec::new();
+
+                while let Some(tc_elem) = find_xml_element(tr_body, tc_cursor, "<a:tc", "</a:tc>") {
+                    tc_cursor = tc_elem.next_cursor;
+                    if tc_elem.is_self_closing {
+                        row_cells.push(String::new());
+                        continue;
+                    }
+                    let tc_body = tc_elem.body;
+
+                    let runs = extract_paragraph_runs(tc_body);
+                    let cell_text = runs
+                        .iter()
+                        .map(|(t, _)| t.as_str())
+                        .collect::<Vec<_>>()
+                        .join("")
+                        .trim()
+                        .to_string();
+                    row_cells.push(cell_text);
+                }
+
+                if !row_cells.is_empty() {
+                    all_rows.push(row_cells);
+                }
+            }
+
+            if !all_rows.is_empty() {
+                let headers = all_rows[0].clone();
+                let rows = if all_rows.len() > 1 {
+                    all_rows[1..].to_vec()
+                } else {
+                    Vec::new()
+                };
+                tables.push(SlideTableData { headers, rows });
+            }
+        }
+    }
+
+    let title = if !title_parts.is_empty() {
+        title_parts.join(" ")
+    } else {
+        format!("Slide {slide_number}")
+    };
+
+    let is_title_slide = has_ctr_title
+        || (slide_number == 1 && blocks.is_empty() && tables.is_empty())
+        || (subtitle.is_some() && blocks.is_empty() && tables.is_empty());
+
+    SlideData {
+        slide_number,
+        title,
+        subtitle,
+        background_color,
+        blocks,
+        tables,
+        footers,
+        is_title_slide,
+    }
+}
+
+fn load_pptx(path: &Path) -> FileKind {
+    let entries = read_zip_entry(path, |name| {
+        name == "ppt/presentation.xml"
+            || name == "ppt/_rels/presentation.xml.rels"
+            || (name.starts_with("ppt/slides/slide") && name.ends_with(".xml") && !name.contains("Layout") && !name.contains("Master") && !name.contains("_rels"))
+            || name == "content.xml"
+    });
+
+    let mut pres_xml = None;
+    let mut rels_xml = None;
+    let mut slides_map: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut odp_content = None;
+
+    for (name, data) in entries {
+        if name == "ppt/presentation.xml" {
+            pres_xml = String::from_utf8(data).ok();
+        } else if name == "ppt/_rels/presentation.xml.rels" {
+            rels_xml = String::from_utf8(data).ok();
+        } else if name.starts_with("ppt/slides/slide") && name.ends_with(".xml") {
+            slides_map.insert(name, data);
+        } else if name == "content.xml" {
+            odp_content = String::from_utf8(data).ok();
+        }
+    }
+
+    let mut aspect_ratio = 16.0 / 9.0;
+    let mut ordered_slide_names = Vec::new();
+
+    if let Some(xml) = &pres_xml {
+        let (ar, rids) = parse_presentation_xml(xml);
+        aspect_ratio = ar;
+
+        let rid_map = rels_xml.as_deref().map(parse_presentation_rels_xml).unwrap_or_default();
+
+        for rid in rids {
+            if let Some(path) = rid_map.get(&rid) {
+                if slides_map.contains_key(path) {
+                    ordered_slide_names.push(path.clone());
+                }
             } else {
-                slides.push(SlideInfo {
-                    slide_number: idx + 1,
-                    title: format!("Slide {}", idx + 1),
-                    bullets: vec![],
-                    is_title_slide: idx == 0,
-                });
+                let num_digits: String = rid.chars().filter(|c| c.is_ascii_digit()).collect();
+                let candidate = format!("ppt/slides/slide{num_digits}.xml");
+                if slides_map.contains_key(&candidate) {
+                    ordered_slide_names.push(candidate);
+                }
+            }
+        }
+    }
+
+    if ordered_slide_names.is_empty() {
+        let mut all_slide_paths: Vec<String> = slides_map.keys().cloned().collect();
+        all_slide_paths.sort_by_key(|name| {
+            name.chars()
+                .filter(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse::<usize>()
+                .unwrap_or(0)
+        });
+        ordered_slide_names = all_slide_paths;
+    } else {
+        let mut missing: Vec<String> = slides_map
+            .keys()
+            .filter(|k| !ordered_slide_names.contains(k))
+            .cloned()
+            .collect();
+        missing.sort();
+        ordered_slide_names.extend(missing);
+    }
+
+    let mut slides = Vec::new();
+    for (idx, slide_name) in ordered_slide_names.into_iter().enumerate() {
+        if let Some(data) = slides_map.get(&slide_name) {
+            if let Ok(xml) = std::str::from_utf8(data) {
+                let slide_data = parse_slide_xml(xml, idx + 1);
+                slides.push(slide_data);
             }
         }
     }
 
     if slides.is_empty() {
-        slides.push(SlideInfo {
+        if let Some(xml) = odp_content {
+            let paras = extract_xml_paragraphs(&xml);
+            let title = paras.first().cloned().unwrap_or_else(|| "Presentation".to_string());
+            let bullets = if paras.len() > 1 {
+                paras[1..]
+                    .iter()
+                    .map(|p| SlideContentBlock::Paragraph {
+                        text: p.clone(),
+                        bold: false,
+                        level: 0,
+                        is_bullet: true,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            slides.push(SlideData {
+                slide_number: 1,
+                title,
+                subtitle: None,
+                background_color: None,
+                blocks: bullets,
+                tables: Vec::new(),
+                footers: Vec::new(),
+                is_title_slide: true,
+            });
+        }
+    }
+
+    if slides.is_empty() {
+        slides.push(SlideData {
             slide_number: 1,
-            title: "Presentation".into(),
-            bullets: vec!["Slide in vector/shape graphics format".into()],
+            title: "Empty Presentation".into(),
+            subtitle: None,
+            background_color: None,
+            blocks: vec![SlideContentBlock::Paragraph {
+                text: "No slide content found".into(),
+                bold: false,
+                level: 0,
+                is_bullet: false,
+            }],
+            tables: Vec::new(),
+            footers: Vec::new(),
             is_title_slide: true,
         });
     }
 
     FileKind::Presentation {
-        slides,
+        presentation: PresentationData {
+            aspect_ratio,
+            slides,
+        },
         current_slide: 0,
     }
 }
@@ -3516,6 +5243,17 @@ mod tests {
     }
 
     #[test]
+    fn test_calculate_scrubber_width_bounds() {
+        assert_eq!(calculate_scrubber_width(1000.0), 790.0);
+        assert_eq!(calculate_scrubber_width(480.0), 270.0);
+        assert_eq!(calculate_scrubber_width(250.0), 60.0);
+        assert_eq!(calculate_scrubber_width(210.0), 60.0);
+        assert_eq!(calculate_scrubber_width(100.0), 60.0);
+        assert_eq!(calculate_scrubber_width(0.0), 60.0);
+        assert_eq!(calculate_scrubber_width(-50.0), 60.0);
+    }
+
+    #[test]
     fn test_calculate_target_dims() {
         let (w, h) = calculate_target_dims(1920, 1080, 854, 480);
         assert_eq!(w, 854);
@@ -3543,12 +5281,17 @@ mod tests {
         assert_eq!(audio_sz, egui::vec2(580.0, 440.0));
 
         // PDF
-        app.file_kind = FileKind::Pdf { current_page: 1, total_pages: 5, page_image: None };
+        app.file_kind = FileKind::Pdf {
+            current_page: 1,
+            total_pages: 5,
+            page_images: HashMap::new(),
+            page_textures: HashMap::new(),
+        };
         let pdf_sz = app.calculate_optimal_size();
         assert_eq!(pdf_sz, egui::vec2(1020.0, 880.0));
 
         // PPTX
-        app.file_kind = FileKind::Presentation { slides: vec![], current_slide: 0 };
+        app.file_kind = FileKind::Presentation { presentation: PresentationData::default(), current_slide: 0 };
         let ppt_sz = app.calculate_optimal_size();
         assert_eq!(ppt_sz, egui::vec2(1140.0, 680.0));
 
@@ -3556,5 +5299,475 @@ mod tests {
         app.file_kind = FileKind::Image { width: 1000, height: 2000, uri: "".into() };
         let img_sz = app.calculate_optimal_size();
         assert!(img_sz.x < img_sz.y);
+    }
+
+    #[test]
+    fn test_estimate_pdf_pages_no_overcount() {
+        let raw_pdf = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R >>\nendobj\n4 0 obj\n<< /Type /Page /Parent 2 0 R >>\nendobj\n";
+        let count = estimate_pdf_pages_from_bytes(raw_pdf);
+        assert_eq!(count, Some(2), "Must not overcount /Type /Pages container");
+    }
+
+    #[test]
+    fn test_estimate_pdf_pages_compact_and_varied_delimiters() {
+        let raw_pdf = b"%PDF-1.4\n1 0 obj\n<< /Type/Pages /Kids [2 0 R] /Count 1 >>\nendobj\n2 0 obj\n<< /Type/Page/Parent 1 0 R >>\nendobj\n";
+        let count = estimate_pdf_pages_from_bytes(raw_pdf);
+        assert_eq!(count, Some(1));
+    }
+
+    #[test]
+    fn test_estimate_pdf_pages_whitespace_variations() {
+        let raw_pdf = b"%PDF-1.4\n<< /Type\r\n  /Page >>\n<< /Type\t/Page/Contents 5 0 R >>\n<< /Type /Pages >>\n";
+        let count = estimate_pdf_pages_from_bytes(raw_pdf);
+        assert_eq!(count, Some(2));
+    }
+
+    #[test]
+    fn test_pdf_aspect_ratio_preservation_a4() {
+        // A4 Portrait at 150 DPI: 1240 x 1754 (or 595.28 x 841.89)
+        let tex_w = 1240.0_f32;
+        let tex_h = 1754.0_f32;
+        let native_aspect = tex_w / tex_h;
+
+        let window_sizes = [
+            (1020.0_f32, 880.0_f32),
+            (1920.0, 1080.0),
+            (800.0, 600.0),
+            (1440.0, 900.0),
+            (600.0, 1200.0),
+        ];
+        let zoom_levels = [0.5_f32, 1.0, 1.5, 2.0];
+
+        for &(w, h) in &window_sizes {
+            for &zoom in &zoom_levels {
+                let margin = 24.0_f32;
+                let max_w = (w - 136.0 - margin * 2.0).max(10.0);
+                let max_h = (h - 48.0 - margin * 2.0).max(10.0);
+                let fit_scale = (max_w / tex_w).min(max_h / tex_h);
+                let target_w = tex_w * fit_scale * zoom;
+                let target_h = tex_h * fit_scale * zoom;
+
+                let rendered_aspect = target_w / target_h;
+                let error = (rendered_aspect - native_aspect).abs();
+                assert!(
+                    error < 1e-6,
+                    "Aspect ratio distorted! Window: ({w}, {h}), Zoom: {zoom}, Error: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_pdf_page_navigation_clamp() {
+        let total_pages = 5;
+        let mut current_page = 1;
+
+        // PageDown
+        current_page = (current_page + 1).min(total_pages);
+        assert_eq!(current_page, 2);
+
+        // End
+        current_page = total_pages;
+        assert_eq!(current_page, 5);
+
+        // PageDown at end clamps to total_pages
+        current_page = (current_page + 1).min(total_pages);
+        assert_eq!(current_page, 5);
+
+        // PageUp
+        current_page = (current_page - 1).max(1);
+        assert_eq!(current_page, 4);
+
+        // Home
+        current_page = 1;
+        assert_eq!(current_page, 1);
+
+        // PageUp at beginning clamps to 1
+        current_page = (current_page - 1).max(1);
+        assert_eq!(current_page, 1);
+    }
+
+    #[test]
+    fn test_pptx_slide_dimensions_parsing() {
+        // Standard 16:9
+        let xml_16_9 = r#"<p:presentation><p:sldSz cx="12192000" cy="6858000"/><p:sldIdLst><p:sldId id="256" r:id="rId1"/><p:sldId id="257" r:id="rId2"/></p:sldIdLst></p:presentation>"#;
+        let (ar_16_9, rids_16_9) = parse_presentation_xml(xml_16_9);
+        assert!((ar_16_9 - 16.0 / 9.0).abs() < 1e-4);
+        assert_eq!(rids_16_9, vec!["rId1", "rId2"]);
+
+        // Standard 4:3
+        let xml_4_3 = r#"<p:presentation><p:sldSz cx="9144000" cy="6858000"/></p:presentation>"#;
+        let (ar_4_3, _) = parse_presentation_xml(xml_4_3);
+        assert!((ar_4_3 - 4.0 / 3.0).abs() < 1e-4);
+
+        // Fallback on missing or invalid
+        let xml_empty = r#"<p:presentation></p:presentation>"#;
+        let (ar_default, _) = parse_presentation_xml(xml_empty);
+        assert!((ar_default - 16.0 / 9.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_pptx_shape_and_placeholder_extraction() {
+        let title_slide_xml = r#"<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+            <p:cSld>
+                <p:spTree>
+                    <p:sp>
+                        <p:nvSpPr><p:nvPr><p:ph type="ctrTitle"/></p:nvPr></p:nvSpPr>
+                        <p:txBody><a:p><a:r><a:t>Sample Presentation Title</a:t></a:r></a:p></p:txBody>
+                    </p:sp>
+                    <p:sp>
+                        <p:nvSpPr><p:nvPr><p:ph type="subTitle"/></p:nvPr></p:nvSpPr>
+                        <p:txBody><a:p><a:r><a:t>Presentation Subtitle Line</a:t></a:r></a:p></p:txBody>
+                    </p:sp>
+                    <p:sp>
+                        <p:nvSpPr><p:nvPr><p:ph type="ftr"/></p:nvPr></p:nvSpPr>
+                        <p:txBody><a:p><a:r><a:t>Confidential Slide Footer</a:t></a:r></a:p></p:txBody>
+                    </p:sp>
+                </p:spTree>
+            </p:cSld>
+        </p:sld>"#;
+
+        let title_slide = parse_slide_xml(title_slide_xml, 1);
+        assert_eq!(title_slide.title, "Sample Presentation Title");
+        assert_eq!(title_slide.subtitle.as_deref(), Some("Presentation Subtitle Line"));
+        assert!(title_slide.is_title_slide);
+        assert_eq!(title_slide.footers, vec!["Confidential Slide Footer"]);
+
+        let content_slide_xml = r#"<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+            <p:cSld>
+                <p:spTree>
+                    <p:sp>
+                        <p:nvSpPr><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr>
+                        <p:txBody><a:p><a:r><a:t>Architecture Overview</a:t></a:r></a:p></p:txBody>
+                    </p:sp>
+                    <p:sp>
+                        <p:nvSpPr><p:nvPr><p:ph type="body"/></p:nvPr></p:nvSpPr>
+                        <p:txBody>
+                            <a:p><a:pPr lvl="0"/><a:r><a:rPr b="1"/><a:t>Primary Feature</a:t></a:r></a:p>
+                            <a:p><a:pPr lvl="1"/><a:r><a:t>Sub-feature Detail</a:t></a:r></a:p>
+                            <a:p><a:pPr lvl="2"><a:buNone/></a:pPr><a:r><a:t>Nested Plain Note</a:t></a:r></a:p>
+                        </p:txBody>
+                    </p:sp>
+                </p:spTree>
+            </p:cSld>
+        </p:sld>"#;
+
+        let content_slide = parse_slide_xml(content_slide_xml, 2);
+        assert_eq!(content_slide.title, "Architecture Overview");
+        assert!(!content_slide.is_title_slide);
+        assert_eq!(content_slide.blocks.len(), 3);
+
+        match &content_slide.blocks[0] {
+            SlideContentBlock::Paragraph { text, bold, level, is_bullet } => {
+                assert_eq!(text, "Primary Feature");
+                assert!(*bold);
+                assert_eq!(*level, 0);
+                assert!(*is_bullet);
+            }
+            _ => panic!("Expected Paragraph block"),
+        }
+
+        match &content_slide.blocks[1] {
+            SlideContentBlock::Paragraph { text, level, is_bullet, .. } => {
+                assert_eq!(text, "Sub-feature Detail");
+                assert_eq!(*level, 1);
+                assert!(*is_bullet);
+            }
+            _ => panic!("Expected Paragraph block"),
+        }
+
+        match &content_slide.blocks[2] {
+            SlideContentBlock::Paragraph { text, level, is_bullet, .. } => {
+                assert_eq!(text, "Nested Plain Note");
+                assert_eq!(*level, 2);
+                assert!(!*is_bullet);
+            }
+            _ => panic!("Expected Paragraph block"),
+        }
+    }
+
+    #[test]
+    fn test_pptx_table_extraction() {
+        let table_slide_xml = r#"<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+            <p:cSld>
+                <p:spTree>
+                    <p:sp>
+                        <p:nvSpPr><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr>
+                        <p:txBody><a:p><a:r><a:t>Metrics Summary</a:t></a:r></a:p></p:txBody>
+                    </p:sp>
+                    <p:graphicFrame>
+                        <a:graphic>
+                            <a:graphicData>
+                                <a:tbl>
+                                    <a:tr>
+                                        <a:tc><a:txBody><a:p><a:r><a:t>Metric</a:t></a:r></a:p></a:txBody></a:tc>
+                                        <a:tc><a:txBody><a:p><a:r><a:t>Target</a:t></a:r></a:p></a:txBody></a:tc>
+                                        <a:tc><a:txBody><a:p><a:r><a:t>Status</a:t></a:r></a:p></a:txBody></a:tc>
+                                    </a:tr>
+                                    <a:tr>
+                                        <a:tc><a:txBody><a:p><a:r><a:t>Latency</a:t></a:r></a:p></a:txBody></a:tc>
+                                        <a:tc><a:txBody><a:p><a:r><a:t>&lt;16ms</a:t></a:r></a:p></a:txBody></a:tc>
+                                        <a:tc><a:txBody><a:p><a:r><a:t>PASS</a:t></a:r></a:p></a:txBody></a:tc>
+                                    </a:tr>
+                                </a:tbl>
+                            </a:graphicData>
+                        </a:graphic>
+                    </p:graphicFrame>
+                </p:spTree>
+            </p:cSld>
+        </p:sld>"#;
+
+        let slide = parse_slide_xml(table_slide_xml, 3);
+        assert_eq!(slide.title, "Metrics Summary");
+        assert_eq!(slide.tables.len(), 1);
+        let table = &slide.tables[0];
+        assert_eq!(table.headers, vec!["Metric", "Target", "Status"]);
+        assert_eq!(table.rows.len(), 1);
+        assert_eq!(table.rows[0], vec!["Latency", "<16ms", "PASS"]);
+    }
+
+    #[test]
+    fn test_presentation_aspect_ratio_containment() {
+        let avail = egui::vec2(1200.0, 800.0);
+
+        let (w16, h16, scale16) = compute_presentation_slide_dimensions(avail, 16.0 / 9.0, 48.0);
+        assert!(((w16 / h16) - 16.0 / 9.0).abs() < 1e-3);
+        assert!(w16 <= avail.x && h16 <= avail.y - 48.0);
+        assert!(scale16 >= 0.6 && scale16 <= 2.5);
+
+        let (w4, h4, scale4) = compute_presentation_slide_dimensions(avail, 4.0 / 3.0, 48.0);
+        assert!(((w4 / h4) - 4.0 / 3.0).abs() < 1e-3);
+        assert!(w4 <= avail.x && h4 <= avail.y - 48.0);
+        assert!(scale4 >= 0.6 && scale4 <= 2.5);
+
+        let (w_nan, h_nan, _) = compute_presentation_slide_dimensions(avail, f32::NAN, 48.0);
+        assert!(((w_nan / h_nan) - 16.0 / 9.0).abs() < 1e-3);
+
+        let (w_inf, h_inf, _) = compute_presentation_slide_dimensions(avail, f32::INFINITY, 48.0);
+        assert!(((w_inf / h_inf) - 16.0 / 9.0).abs() < 1e-3);
+
+        let (w_zero, h_zero, s_zero) = compute_presentation_slide_dimensions(egui::vec2(0.0, 0.0), 16.0 / 9.0, 48.0);
+        assert!(w_zero >= 160.0 && h_zero >= 90.0);
+        assert_eq!(s_zero, 0.6);
+    }
+
+    #[test]
+    fn test_pptx_slide_navigation_boundary_clamps() {
+        let total_slides = 4_usize;
+        let mut current_slide = 0_usize;
+
+        current_slide = current_slide.saturating_sub(1);
+        assert_eq!(current_slide, 0);
+
+        for step in 1..total_slides {
+            current_slide = (current_slide + 1).min(total_slides - 1);
+            assert_eq!(current_slide, step);
+        }
+
+        current_slide = (current_slide + 1).min(total_slides - 1);
+        assert_eq!(current_slide, 3);
+
+        current_slide = 0;
+        assert_eq!(current_slide, 0);
+
+        current_slide = total_slides - 1;
+        assert_eq!(current_slide, 3);
+    }
+
+    #[test]
+    fn test_slide_theme_luminance_detection() {
+        let dark_theme = SlideThemeColors::from_background(Some(egui::Color32::from_rgb(20, 20, 22)));
+        assert!(dark_theme.primary_text.r() > 200);
+        assert!(dark_theme.primary_text.g() > 200);
+        assert!(dark_theme.primary_text.b() > 200);
+
+        let light_theme = SlideThemeColors::from_background(Some(egui::Color32::from_rgb(255, 255, 255)));
+        assert!(light_theme.primary_text.r() < 50);
+        assert!(light_theme.primary_text.g() < 50);
+        assert!(light_theme.primary_text.b() < 50);
+
+        let default_theme = SlideThemeColors::from_background(None);
+        assert!(default_theme.primary_text.r() < 50);
+    }
+
+    #[test]
+    fn test_load_pptx_real_fixtures() {
+        let sample_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample.pptx");
+        if sample_path.exists() {
+            let kind = load_pptx(&sample_path);
+            match kind {
+                FileKind::Presentation { presentation, current_slide } => {
+                    assert_eq!(current_slide, 0);
+                    assert!((presentation.aspect_ratio - 16.0 / 9.0).abs() < 1e-4);
+                    assert_eq!(presentation.slides.len(), 4);
+                    assert_eq!(presentation.slides[0].title, "Linux Quick Look Presentation");
+                    assert_eq!(presentation.slides[0].subtitle.as_deref(), Some("Modern Desktop Preview Architecture"));
+                    assert!(presentation.slides[0].is_title_slide);
+                    assert_eq!(presentation.slides[1].title, "Core Architecture & Subsystems");
+                    assert!(!presentation.slides[1].is_title_slide);
+                    assert_eq!(presentation.slides[2].title, "Performance Benchmark & Reliability");
+                    assert_eq!(presentation.slides[2].tables.len(), 1);
+                    assert_eq!(presentation.slides[3].title, "Conclusion & Quality Standards");
+                }
+                _ => panic!("Expected FileKind::Presentation"),
+            }
+        }
+
+        let p43_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/portrait_4_3.pptx");
+        if p43_path.exists() {
+            let kind = load_pptx(&p43_path);
+            match kind {
+                FileKind::Presentation { presentation, current_slide } => {
+                    assert_eq!(current_slide, 0);
+                    assert!((presentation.aspect_ratio - 4.0 / 3.0).abs() < 1e-4);
+                    assert_eq!(presentation.slides.len(), 2);
+                    assert_eq!(presentation.slides[0].title, "Classic 4:3 Presentation");
+                    assert!(presentation.slides[0].is_title_slide);
+                }
+                _ => panic!("Expected FileKind::Presentation"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_xml_tag() {
+        // Self-closing tag
+        let (tag, len) = parse_xml_tag(r#"<p:sldSz cx="12192000" cy="6858000"/>rest"#).unwrap();
+        assert_eq!(tag, r#"<p:sldSz cx="12192000" cy="6858000"/>"#);
+        assert_eq!(len, tag.len());
+
+        // Regular tag
+        let (tag2, len2) = parse_xml_tag(r#"<p:sldId id="1">rest"#).unwrap();
+        assert_eq!(tag2, r#"<p:sldId id="1">"#);
+        assert_eq!(len2, tag2.len());
+
+        // Followed by multi-byte UTF-8
+        let (tag3, len3) = parse_xml_tag("<p:sldId>こんにちは").unwrap();
+        assert_eq!(tag3, "<p:sldId>");
+        assert_eq!(len3, 9);
+
+        // At EOF
+        let (tag4, len4) = parse_xml_tag("<p:sldId>").unwrap();
+        assert_eq!(tag4, "<p:sldId>");
+        assert_eq!(len4, 9);
+
+        // Unclosed
+        assert!(parse_xml_tag("<p:sldId").is_none());
+    }
+
+    #[test]
+    fn test_find_xml_element_paired_tag() {
+        let xml = r#"<p:txBody><a:p><a:r><a:t>Hello</a:t></a:r></a:p></p:txBody>"#;
+        let elem = find_xml_element(xml, 0, "<a:p", "</a:p>").expect("Expected element");
+        assert!(!elem.is_self_closing);
+        assert!(elem.body.contains("Hello"));
+        assert_eq!(elem.next_cursor, xml.find("</p:txBody>").unwrap());
+    }
+
+    #[test]
+    fn test_find_xml_element_self_closing_variants() {
+        let xml = r#"<a:p/><a:p /><a:p lvl="1"/> <a:p lvl="2" />"#;
+        let mut cursor = 0;
+        let mut count = 0;
+        while let Some(elem) = find_xml_element(xml, cursor, "<a:p", "</a:p>") {
+            assert!(elem.is_self_closing);
+            cursor = elem.next_cursor;
+            count += 1;
+        }
+        assert_eq!(count, 4);
+    }
+
+    #[test]
+    fn test_find_xml_element_prefix_boundary_rejection() {
+        let xml = r#"<p:spTree><p:sp><p:txBody><a:pPr lvl="0"/><a:p><a:r><a:t>Inside</a:t></a:r></a:p></p:txBody></p:sp></p:spTree>"#;
+        // "<p:sp" should NOT match "<p:spTree>"
+        let sp_elem = find_xml_element(xml, 0, "<p:sp", "</p:sp>").expect("Should find <p:sp>");
+        assert!(sp_elem.body.starts_with("<p:sp>"));
+
+        // "<a:p" should NOT match "<a:pPr"
+        let p_elem = find_xml_element(sp_elem.body, 0, "<a:p", "</a:p>").expect("Should find <a:p>");
+        assert!(p_elem.body.starts_with("<a:p>"));
+    }
+
+    #[test]
+    fn test_pptx_self_closing_paragraphs_in_slide() {
+        let slide_xml = r#"<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+            <p:cSld><p:spTree>
+                <p:sp>
+                    <p:nvSpPr><p:nvPr><p:ph type="body"/></p:nvPr></p:nvSpPr>
+                    <p:txBody>
+                        <a:p><a:r><a:t>Bullet 1</a:t></a:r></a:p>
+                        <a:p/>
+                        <a:p><a:r><a:t>Bullet 2</a:t></a:r></a:p>
+                        <a:p lvl="1"/>
+                        <a:p><a:r><a:t>Bullet 3</a:t></a:r></a:p>
+                        <a:p/>
+                    </p:txBody>
+                </p:sp>
+            </p:spTree></p:cSld>
+        </p:sld>"#;
+        let slide = parse_slide_xml(slide_xml, 2);
+        assert_eq!(slide.blocks.len(), 3);
+        if let SlideContentBlock::Paragraph { text, .. } = &slide.blocks[0] {
+            assert_eq!(text, "Bullet 1");
+        }
+        if let SlideContentBlock::Paragraph { text, .. } = &slide.blocks[1] {
+            assert_eq!(text, "Bullet 2");
+        }
+        if let SlideContentBlock::Paragraph { text, .. } = &slide.blocks[2] {
+            assert_eq!(text, "Bullet 3");
+        }
+    }
+
+    #[test]
+    fn test_pptx_self_closing_table_cells_and_rows() {
+        let table_slide_xml = r#"<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+            <p:cSld><p:spTree>
+                <p:graphicFrame>
+                    <a:tbl>
+                        <a:tr>
+                            <a:tc><a:txBody><a:p><a:r><a:t>Col 1</a:t></a:r></a:p></a:txBody></a:tc>
+                            <a:tc><a:txBody><a:p><a:r><a:t>Col 2</a:t></a:r></a:p></a:txBody></a:tc>
+                            <a:tc><a:txBody><a:p><a:r><a:t>Col 3</a:t></a:r></a:p></a:txBody></a:tc>
+                        </a:tr>
+                        <a:tr>
+                            <a:tc><a:txBody><a:p><a:r><a:t>Row2-C1</a:t></a:r></a:p></a:txBody></a:tc>
+                            <a:tc/>
+                            <a:tc><a:txBody><a:p><a:r><a:t>Row2-C3</a:t></a:r></a:p></a:txBody></a:tc>
+                        </a:tr>
+                        <a:tr/>
+                        <a:tr>
+                            <a:tc><a:txBody><a:p><a:r><a:t>Row4-C1</a:t></a:r></a:p></a:txBody></a:tc>
+                            <a:tc><a:txBody><a:p><a:r><a:t>Row4-C2</a:t></a:r></a:p></a:txBody></a:tc>
+                            <a:tc/>
+                        </a:tr>
+                    </a:tbl>
+                </p:graphicFrame>
+            </p:spTree></p:cSld>
+        </p:sld>"#;
+        let slide = parse_slide_xml(table_slide_xml, 3);
+        assert_eq!(slide.tables.len(), 1);
+        let table = &slide.tables[0];
+        assert_eq!(table.headers, vec!["Col 1", "Col 2", "Col 3"]);
+        assert_eq!(table.rows.len(), 2);
+        assert_eq!(table.rows[0], vec!["Row2-C1", "", "Row2-C3"]);
+        assert_eq!(table.rows[1], vec!["Row4-C1", "Row4-C2", ""]);
+    }
+
+    #[test]
+    fn test_aspect_ratio_proportional_clamping_4_3_at_300x200() {
+        let (w, h, scale) = compute_presentation_slide_dimensions(
+            egui::vec2(300.0, 200.0),
+            4.0 / 3.0,
+            48.0,
+        );
+        let ratio = w / h;
+        assert!(
+            (ratio - 4.0 / 3.0).abs() < 1e-4,
+            "4:3 aspect ratio violated at 300x200: w={w}, h={h}, ratio={ratio}"
+        );
+        assert!(scale >= 0.6 && scale <= 2.5, "Scale factor out of bounds: {scale}");
+        assert!(w <= 300.0, "Slide width {w} exceeded available width 300.0");
+        assert!(h <= 200.0 - 48.0, "Slide height {h} exceeded available height minus clearance 152.0");
     }
 }
