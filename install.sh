@@ -170,24 +170,46 @@ echo "Usage: quicklook <file_or_dir>"
 echo "In KDE Dolphin: Right-click any file -> Quick Look, or press Space"
 
 # Check helper tools for PDF page rendering and video frame previews
-MISSING_HELPERS=()
-if ! command -v pdftoppm >/dev/null 2>&1 && ! command -v gs >/dev/null 2>&1; then
-    MISSING_HELPERS+=("poppler-utils (for PDF page-by-page rendering)")
-fi
-if ! command -v ffmpeg >/dev/null 2>&1 && ! command -v ffmpegthumbnailer >/dev/null 2>&1; then
-    MISSING_HELPERS+=("ffmpeg or ffmpegthumbnailer (for video frame previews)")
-fi
+if [ "$(uname -s)" = "Linux" ]; then
+    MISSING_HELPERS=()
+    if ! command -v pdftoppm >/dev/null 2>&1 && ! command -v pdftocairo >/dev/null 2>&1 && ! command -v mutool >/dev/null 2>&1; then
+        if command -v pacman >/dev/null 2>&1; then
+            MISSING_HELPERS+=("poppler (Arch Linux package: 'poppler', provides pdftocairo & pdftoppm)")
+        else
+            MISSING_HELPERS+=("poppler-utils (provides pdftocairo & pdftoppm)")
+        fi
+    fi
+    if ! command -v ffmpeg >/dev/null 2>&1 && ! command -v ffmpegthumbnailer >/dev/null 2>&1; then
+        MISSING_HELPERS+=("ffmpeg (for video playback & timeline scrubbing)")
+    fi
 
-if [ ${#MISSING_HELPERS[@]} -gt 0 ]; then
-    echo ""
-    echo "💡 Note: Quick Look already uses Dolphin's thumbnail cache as an automatic fallback."
-    echo "   To also enable full high-res PDF page-by-page flipping and video frames, install:"
-    for helper in "${MISSING_HELPERS[@]}"; do
-        echo "   - ${helper}"
-    done
-    echo "   Debian / Ubuntu: sudo apt install poppler-utils ffmpeg"
-    echo "   Arch Linux:      sudo pacman -S poppler ffmpeg"
-    echo "   Fedora:          sudo dnf install poppler-utils ffmpeg-free"
+    if [ ${#MISSING_HELPERS[@]} -gt 0 ]; then
+        echo ""
+        echo "💡 Note: Quick Look already uses FreeDesktop / Dolphin thumbnail cache as automatic fallback."
+        echo "   To enable multi-page PDF flipping and video playback on Linux, install:"
+        for helper in "${MISSING_HELPERS[@]}"; do
+            echo "   - ${helper}"
+        done
+        if command -v pacman >/dev/null 2>&1; then
+            echo ""
+            echo "   👉 Arch Linux command: sudo pacman -S --needed poppler ffmpeg"
+            if [ -t 0 ] && [ "${CI:-0}" != "1" ]; then
+                read -p "   Install now via pacman? [y/N] " -n 1 -r || true
+                echo ""
+                if [[ "${REPLY:-n}" =~ ^[Yy]$ ]]; then
+                    sudo pacman -S --needed poppler ffmpeg || true
+                fi
+            fi
+        elif command -v apt >/dev/null 2>&1; then
+            echo ""
+            echo "   👉 Debian / Ubuntu command: sudo apt install poppler-utils ffmpeg"
+        elif command -v dnf >/dev/null 2>&1; then
+            echo ""
+            echo "   👉 Fedora command: sudo dnf install poppler-utils ffmpeg-free"
+        fi
+    fi
+else
+    echo "==> macOS detected: Built-in CoreGraphics Quartz 2D active. Zero external dependencies required."
 fi
 
 # ---------------------------------------------------------------------------

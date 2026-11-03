@@ -608,14 +608,15 @@ impl QuickLookApp {
             _ => {}
         }
 
-        // 7. PDF (Instant async load, 0ms main thread blocking)
+        // 7. PDF (Instant load with native Apple Quartz / CoreGraphics)
         if ext == "pdf" {
             let total_pages = pdf_get_total_pages(path).max(1);
             let mut page_images = HashMap::new();
-            if let Some(img) = get_xdg_thumbnail(path) {
+            if let Some(img) = render_pdf_page_to_image(path, 1) {
+                page_images.insert(1, img);
+            } else if let Some(img) = get_xdg_thumbnail(path) {
                 page_images.insert(1, img);
             }
-            self.pdf_loader.request_page(path, 1);
             if total_pages > 1 {
                 self.pdf_loader.request_page(path, 2);
             }
@@ -2620,8 +2621,8 @@ fn render_pdf_viewer(
 
     let mut page_to_navigate = None;
 
-    // 1. Left sidebar — page thumbnails (instant vector cards, zero batch pdftoppm overhead)
-    egui::SidePanel::left("pdf_thumbs")
+    // 1. Right sidebar — page thumbnails (macOS Quick Look layout matching Screenshot 1)
+    egui::SidePanel::right("pdf_thumbs")
         .exact_width(136.0)
         .resizable(false)
         .frame(
@@ -2845,32 +2846,55 @@ fn render_pdf_viewer(
                     img.paint_at(ui, rect);
                 } else {
                     let is_failed = pdf_loader.failed.contains(current_page);
-                    painter.text(
-                        rect.center() - egui::vec2(0.0, 16.0),
-                        egui::Align2::CENTER_CENTER,
-                        if is_failed { "⚠️" } else { "📄" },
-                        egui::FontId::proportional(42.0),
-                        if is_failed {
-                            egui::Color32::from_rgb(220, 120, 100)
-                        } else {
-                            egui::Color32::from_rgb(180, 180, 190)
-                        },
-                    );
-                    painter.text(
-                        rect.center() + egui::vec2(0.0, 24.0),
-                        egui::Align2::CENTER_CENTER,
-                        if is_failed {
-                            format!("Page {} (Render Failed)", *current_page)
-                        } else {
-                            format!("Loading Page {} of {}...", *current_page, total_pages)
-                        },
-                        egui::FontId::proportional(14.0),
-                        if is_failed {
-                            egui::Color32::from_rgb(180, 90, 80)
-                        } else {
-                            egui::Color32::from_rgb(120, 120, 130)
-                        },
-                    );
+                    if is_failed {
+                        painter.text(
+                            rect.center() - egui::vec2(0.0, 36.0),
+                            egui::Align2::CENTER_CENTER,
+                            "📄",
+                            egui::FontId::proportional(44.0),
+                            egui::Color32::from_rgb(180, 180, 190),
+                        );
+                        painter.text(
+                            rect.center() - egui::vec2(0.0, 2.0),
+                            egui::Align2::CENTER_CENTER,
+                            format!("Page {} Preview Unavailable", *current_page),
+                            egui::FontId::proportional(15.0),
+                            egui::Color32::from_rgb(20, 20, 22),
+                        );
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            let (_distro, cmd) = get_linux_package_install_hint();
+                            painter.text(
+                                rect.center() + egui::vec2(0.0, 24.0),
+                                egui::Align2::CENTER_CENTER,
+                                format!("To preview all pages, install: {cmd}"),
+                                egui::FontId::proportional(11.5),
+                                egui::Color32::from_rgb(120, 120, 130),
+                            );
+                        }
+                        painter.text(
+                            rect.center() + egui::vec2(0.0, 48.0),
+                            egui::Align2::CENTER_CENTER,
+                            "Press 'O' or Enter to open in system viewer",
+                            egui::FontId::proportional(12.5),
+                            egui::Color32::from_rgb(0, 122, 255),
+                        );
+                    } else {
+                        painter.text(
+                            rect.center() - egui::vec2(0.0, 16.0),
+                            egui::Align2::CENTER_CENTER,
+                            "📄",
+                            egui::FontId::proportional(42.0),
+                            egui::Color32::from_rgb(180, 180, 190),
+                        );
+                        painter.text(
+                            rect.center() + egui::vec2(0.0, 24.0),
+                            egui::Align2::CENTER_CENTER,
+                            format!("Loading Page {} of {}...", *current_page, total_pages),
+                            egui::FontId::proportional(14.0),
+                            egui::Color32::from_rgb(120, 120, 130),
+                        );
+                    }
                 }
 
                 // Crisp boundary stroke
@@ -5189,7 +5213,374 @@ fn load_color_image_from_bytes(bytes: &[u8]) -> Option<egui::ColorImage> {
     Some(egui::ColorImage::from_rgba_unmultiplied(size, &pixels))
 }
 
+#[cfg(target_os = "macos")]
+pub mod macos_pdf {
+    use eframe::egui;
+    use std::ffi::c_void;
+    use std::os::raw::c_int;
+    use std::path::Path;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct CGPoint {
+        pub x: f64,
+        pub y: f64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct CGSize {
+        pub width: f64,
+        pub height: f64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct CGRect {
+        pub origin: CGPoint,
+        pub size: CGSize,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug)]
+    pub struct CGAffineTransform {
+        pub a: f64,
+        pub b: f64,
+        pub c: f64,
+        pub d: f64,
+        pub tx: f64,
+        pub ty: f64,
+    }
+
+    pub type CFTypeRef = *const c_void;
+    pub type CFURLRef = *const c_void;
+    pub type CGPDFDocumentRef = *const c_void;
+    pub type CGPDFPageRef = *const c_void;
+    pub type CGContextRef = *mut c_void;
+    pub type CGColorSpaceRef = *const c_void;
+    pub type CGDataProviderRef = *const c_void;
+
+    pub const K_CGPDF_MEDIA_BOX: c_int = 0;
+    pub const K_CGPDF_CROP_BOX: c_int = 1;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFURLCreateFromFileSystemRepresentation(
+            allocator: *const c_void,
+            buffer: *const u8,
+            buf_len: isize,
+            is_directory: bool,
+        ) -> CFURLRef;
+        fn CFRelease(cf: CFTypeRef);
+
+        fn CGDataProviderCreateWithData(
+            info: *mut c_void,
+            data: *const c_void,
+            size: usize,
+            release_data: Option<unsafe extern "C" fn(*mut c_void, *const c_void, usize)>,
+        ) -> CGDataProviderRef;
+        fn CGDataProviderRelease(provider: CGDataProviderRef);
+
+        fn CGPDFDocumentCreateWithURL(url: CFURLRef) -> CGPDFDocumentRef;
+        fn CGPDFDocumentCreateWithProvider(provider: CGDataProviderRef) -> CGPDFDocumentRef;
+        fn CGPDFDocumentGetNumberOfPages(document: CGPDFDocumentRef) -> usize;
+        fn CGPDFDocumentGetPage(document: CGPDFDocumentRef, page_number: usize) -> CGPDFPageRef;
+        fn CGPDFDocumentRelease(document: CGPDFDocumentRef);
+
+        fn CGPDFPageGetBoxRect(page: CGPDFPageRef, box_type: c_int) -> CGRect;
+        fn CGPDFPageGetRotationAngle(page: CGPDFPageRef) -> c_int;
+        fn CGPDFPageGetDrawingTransform(
+            page: CGPDFPageRef,
+            box_type: c_int,
+            rect: CGRect,
+            rotate: c_int,
+            preserve_aspect_ratio: bool,
+        ) -> CGAffineTransform;
+
+        fn CGColorSpaceCreateDeviceRGB() -> CGColorSpaceRef;
+        fn CGColorSpaceRelease(space: CGColorSpaceRef);
+
+        fn CGBitmapContextCreate(
+            data: *mut c_void,
+            width: usize,
+            height: usize,
+            bits_per_component: usize,
+            bytes_per_row: usize,
+            space: CGColorSpaceRef,
+            bitmap_info: u32,
+        ) -> CGContextRef;
+        fn CGContextRelease(context: CGContextRef);
+
+        fn CGContextSetRGBFillColor(
+            context: CGContextRef,
+            red: f64,
+            green: f64,
+            blue: f64,
+            alpha: f64,
+        );
+        fn CGContextFillRect(context: CGContextRef, rect: CGRect);
+        fn CGContextConcatCTM(context: CGContextRef, transform: CGAffineTransform);
+        fn CGContextDrawPDFPage(context: CGContextRef, page: CGPDFPageRef);
+    }
+
+    unsafe fn render_pdf_document_page(
+        doc: CGPDFDocumentRef,
+        page_number: usize,
+        dpi: f64,
+    ) -> Option<egui::ColorImage> {
+        let total_pages = CGPDFDocumentGetNumberOfPages(doc);
+        if page_number < 1 || page_number > total_pages {
+            return None;
+        }
+
+        let page = CGPDFDocumentGetPage(doc, page_number);
+        if page.is_null() {
+            return None;
+        }
+
+        let mut box_rect = CGPDFPageGetBoxRect(page, K_CGPDF_CROP_BOX);
+        if box_rect.size.width <= 0.0 || box_rect.size.height <= 0.0 {
+            box_rect = CGPDFPageGetBoxRect(page, K_CGPDF_MEDIA_BOX);
+        }
+        if box_rect.size.width <= 0.0 || box_rect.size.height <= 0.0 {
+            return None;
+        }
+
+        let rot_angle = CGPDFPageGetRotationAngle(page).abs() % 360;
+        let (unrotated_w, unrotated_h) = if rot_angle == 90 || rot_angle == 270 {
+            (box_rect.size.height, box_rect.size.width)
+        } else {
+            (box_rect.size.width, box_rect.size.height)
+        };
+
+        let scale = (dpi / 72.0).clamp(0.5, 4.0);
+        let width_px = (unrotated_w * scale).round().max(16.0) as usize;
+        let height_px = (unrotated_h * scale).round().max(16.0) as usize;
+
+        let bytes_per_pixel = 4;
+        let bytes_per_row = width_px * bytes_per_pixel;
+        let total_bytes = bytes_per_row * height_px;
+        let mut buffer = vec![255u8; total_bytes];
+
+        let color_space = CGColorSpaceCreateDeviceRGB();
+        if color_space.is_null() {
+            return None;
+        }
+
+        // kCGBitmapByteOrder32Big | kCGImageAlphaPremultipliedLast = 16385
+        let bitmap_info: u32 = (4 << 12) | 1;
+
+        let ctx = CGBitmapContextCreate(
+            buffer.as_mut_ptr() as *mut c_void,
+            width_px,
+            height_px,
+            8,
+            bytes_per_row,
+            color_space,
+            bitmap_info,
+        );
+        CGColorSpaceRelease(color_space);
+
+        if ctx.is_null() {
+            return None;
+        }
+
+        // Fill solid white paper background
+        CGContextSetRGBFillColor(ctx, 1.0, 1.0, 1.0, 1.0);
+        CGContextFillRect(
+            ctx,
+            CGRect {
+                origin: CGPoint { x: 0.0, y: 0.0 },
+                size: CGSize {
+                    width: width_px as f64,
+                    height: height_px as f64,
+                },
+            },
+        );
+
+        // Compute exact transform into destination rectangle preserving aspect ratio
+        let dest_rect = CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: CGSize {
+                width: width_px as f64,
+                height: height_px as f64,
+            },
+        };
+        let transform = CGPDFPageGetDrawingTransform(page, K_CGPDF_CROP_BOX, dest_rect, 0, true);
+        CGContextConcatCTM(ctx, transform);
+
+        // Native Quartz vector rendering
+        CGContextDrawPDFPage(ctx, page);
+
+        CGContextRelease(ctx);
+
+        // Quartz bitmap context has Y=0 at the bottom. Egui expects Y=0 at the top.
+        // Vertically flip row scanlines in memory.
+        let half_h = height_px / 2;
+        let (top_half, bottom_half) = buffer.split_at_mut(half_h * bytes_per_row);
+        for (top_row, bot_row) in top_half
+            .chunks_exact_mut(bytes_per_row)
+            .zip(bottom_half.chunks_exact_mut(bytes_per_row).rev())
+        {
+            top_row.swap_with_slice(bot_row);
+        }
+
+        Some(egui::ColorImage::from_rgba_unmultiplied(
+            [width_px, height_px],
+            &buffer,
+        ))
+    }
+
+    pub fn get_total_pages(path: &Path) -> Option<usize> {
+        let canonical = match std::fs::canonicalize(path) {
+            Ok(p) => p,
+            Err(_) => path.to_path_buf(),
+        };
+        let path_str = canonical.to_str()?;
+        let bytes = path_str.as_bytes();
+        unsafe {
+            let url = CFURLCreateFromFileSystemRepresentation(
+                std::ptr::null(),
+                bytes.as_ptr(),
+                bytes.len() as isize,
+                false,
+            );
+            if url.is_null() {
+                return None;
+            }
+            let doc = CGPDFDocumentCreateWithURL(url);
+            CFRelease(url);
+            if doc.is_null() {
+                return None;
+            }
+            let count = CGPDFDocumentGetNumberOfPages(doc);
+            CGPDFDocumentRelease(doc);
+            if count > 0 {
+                Some(count)
+            } else {
+                None
+            }
+        }
+    }
+
+    pub fn get_total_pages_from_bytes(bytes: &[u8]) -> Option<usize> {
+        if bytes.is_empty() {
+            return None;
+        }
+        unsafe {
+            let provider = CGDataProviderCreateWithData(
+                std::ptr::null_mut(),
+                bytes.as_ptr() as *const c_void,
+                bytes.len(),
+                None,
+            );
+            if provider.is_null() {
+                return None;
+            }
+
+            let doc = CGPDFDocumentCreateWithProvider(provider);
+            CGDataProviderRelease(provider);
+            if doc.is_null() {
+                return None;
+            }
+
+            let count = CGPDFDocumentGetNumberOfPages(doc);
+            CGPDFDocumentRelease(doc);
+            if count > 0 {
+                Some(count)
+            } else {
+                None
+            }
+        }
+    }
+
+    pub fn render_page(path: &Path, page_number: usize, dpi: f64) -> Option<egui::ColorImage> {
+        let canonical = match std::fs::canonicalize(path) {
+            Ok(p) => p,
+            Err(_) => path.to_path_buf(),
+        };
+        let path_str = canonical.to_str()?;
+        let bytes = path_str.as_bytes();
+
+        unsafe {
+            let url = CFURLCreateFromFileSystemRepresentation(
+                std::ptr::null(),
+                bytes.as_ptr(),
+                bytes.len() as isize,
+                false,
+            );
+            if url.is_null() {
+                return None;
+            }
+
+            let doc = CGPDFDocumentCreateWithURL(url);
+            CFRelease(url);
+            if doc.is_null() {
+                return None;
+            }
+
+            let img = render_pdf_document_page(doc, page_number, dpi);
+            CGPDFDocumentRelease(doc);
+            img
+        }
+    }
+
+    pub fn render_page_from_bytes(
+        bytes: &[u8],
+        page_number: usize,
+        dpi: f64,
+    ) -> Option<egui::ColorImage> {
+        if bytes.is_empty() {
+            return None;
+        }
+        unsafe {
+            let provider = CGDataProviderCreateWithData(
+                std::ptr::null_mut(),
+                bytes.as_ptr() as *const c_void,
+                bytes.len(),
+                None,
+            );
+            if provider.is_null() {
+                return None;
+            }
+
+            let doc = CGPDFDocumentCreateWithProvider(provider);
+            CGDataProviderRelease(provider);
+            if doc.is_null() {
+                return None;
+            }
+
+            let img = render_pdf_document_page(doc, page_number, dpi);
+            CGPDFDocumentRelease(doc);
+            img
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn get_linux_package_install_hint() -> (&'static str, &'static str) {
+    if Path::new("/etc/arch-release").exists() {
+        ("Arch Linux", "sudo pacman -S poppler")
+    } else if Path::new("/etc/debian_version").exists() {
+        ("Ubuntu / Debian", "sudo apt install poppler-utils")
+    } else if Path::new("/etc/fedora-release").exists() {
+        ("Fedora", "sudo dnf install poppler-utils")
+    } else if Path::new("/etc/zypp").exists() {
+        ("openSUSE", "sudo zypper install poppler-tools")
+    } else {
+        ("Arch: sudo pacman -S poppler", "Debian: sudo apt install poppler-utils")
+    }
+}
+
 fn pdf_get_total_pages(path: &Path) -> usize {
+    #[cfg(target_os = "macos")]
+    if let Some(count) = macos_pdf::get_total_pages(path) {
+        if count > 0 {
+            return count;
+        }
+    }
+
     // 1. In-memory fast scan (< 1ms, zero subprocess overhead)
     if let Some(count) = estimate_pdf_pages(path) {
         if count > 0 {
@@ -5220,6 +5611,11 @@ fn pdf_get_total_pages(path: &Path) -> usize {
 }
 
 fn render_pdf_page_to_image(path: &Path, page: usize) -> Option<egui::ColorImage> {
+    #[cfg(target_os = "macos")]
+    if let Some(img) = macos_pdf::render_page(path, page, 150.0) {
+        return Some(img);
+    }
+
     let path_str = path.to_str()?;
     let temp_dir = std::env::temp_dir();
 
@@ -5325,7 +5721,24 @@ fn render_pdf_page_to_image(path: &Path, page: usize) -> Option<egui::ColorImage
         }
     }
 
-    // 6. Fallback for page 1: FreeDesktop / KDE thumbnail cache
+    // 6. ImageMagick (magick / convert) - widely available on Linux (including Arch Linux)
+    let page_idx = page.saturating_sub(1);
+    let page_spec = format!("{path_str}[{page_idx}]");
+    for bin in ["magick", "convert"] {
+        if let Ok(output) = std::process::Command::new(bin)
+            .current_dir(&temp_dir)
+            .args(["-density", "150", &page_spec, "-flatten", "png:-"])
+            .output()
+        {
+            if output.status.success() && !output.stdout.is_empty() {
+                if let Some(img) = load_color_image_from_bytes(&output.stdout) {
+                    return Some(img);
+                }
+            }
+        }
+    }
+
+    // 7. Fallback for page 1: FreeDesktop / KDE thumbnail cache
     if page == 1 {
         if let Some(img) = get_xdg_thumbnail(path) {
             return Some(img);
@@ -6088,5 +6501,51 @@ mod tests {
         assert!(scale >= 0.6 && scale <= 2.5, "Scale factor out of bounds: {scale}");
         assert!(w <= 300.0, "Slide width {w} exceeded available width 300.0");
         assert!(h <= 200.0 - 48.0, "Slide height {h} exceeded available height minus clearance 152.0");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_macos_pdf_in_memory_rendering() {
+        let pdf_data = b"%PDF-1.4\n\
+1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n\
+3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>\nendobj\n\
+4 0 obj\n<< /Length 26 >>\nstream\n0 0 0 rg\n0 0 100 100 re\nf\nendstream\nendobj\n\
+xref\n0 5\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \n0000000115 00000 n \n0000000198 00000 n \n\
+trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n274\n%%EOF\n";
+
+        let pages = crate::macos_pdf::get_total_pages_from_bytes(pdf_data);
+        assert_eq!(pages, Some(1));
+
+        let img = crate::macos_pdf::render_page_from_bytes(pdf_data, 1, 72.0);
+        assert!(img.is_some());
+        let img = img.unwrap();
+        assert_eq!(img.size, [100, 100]);
+        assert_eq!(img.pixels[0], egui::Color32::from_rgba_premultiplied(0, 0, 0, 255));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_macos_pdf_file_rendering() {
+        let pdf_data = b"%PDF-1.4\n\
+1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n\
+3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>\nendobj\n\
+4 0 obj\n<< /Length 26 >>\nstream\n0 0 0 rg\n0 0 100 100 re\nf\nendstream\nendobj\n\
+xref\n0 5\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \n0000000115 00000 n \n0000000198 00000 n \n\
+trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n274\n%%EOF\n";
+
+        let temp_path = std::env::temp_dir().join("test_macos_pdf_doc.pdf");
+        std::fs::write(&temp_path, pdf_data).unwrap();
+
+        let count = pdf_get_total_pages(&temp_path);
+        assert_eq!(count, 1);
+
+        let img = render_pdf_page_to_image(&temp_path, 1);
+        assert!(img.is_some());
+        let img = img.unwrap();
+        assert_eq!(img.size, [208, 208]); // 100pt @ 150 DPI = 208px
+
+        let _ = std::fs::remove_file(&temp_path);
     }
 }
