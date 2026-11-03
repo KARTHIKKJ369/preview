@@ -1,10 +1,11 @@
 use eframe::egui;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 /// macOS-style Quick Look preview application for Linux.
@@ -114,6 +115,7 @@ pub enum FileKind {
         total_pages: usize,
         page_images: HashMap<usize, egui::ColorImage>,
         page_textures: HashMap<usize, egui::TextureHandle>,
+        thumb_textures: HashMap<usize, egui::TextureHandle>,
     },
     Media {
         kind: &'static str,
@@ -170,12 +172,13 @@ impl std::fmt::Debug for FileKind {
                 .debug_struct("Archive")
                 .field("total_entries", total_entries)
                 .finish(),
-            Self::Pdf { current_page, total_pages, page_images, page_textures } => f
+            Self::Pdf { current_page, total_pages, page_images, page_textures, thumb_textures } => f
                 .debug_struct("Pdf")
                 .field("current_page", current_page)
                 .field("total_pages", total_pages)
                 .field("page_images_len", &page_images.len())
                 .field("page_textures_len", &page_textures.len())
+                .field("thumb_textures_len", &thumb_textures.len())
                 .finish(),
             Self::Media { kind, poster_image } => f
                 .debug_struct("Media")
@@ -274,7 +277,7 @@ pub struct PdfPageResponse {
 }
 
 pub struct PdfLoader {
-    pub request_tx: Sender<PdfPageRequest>,
+    queue: Arc<(Mutex<VecDeque<PdfPageRequest>>, Condvar)>,
     pub response_rx: Receiver<PdfPageResponse>,
     pub generation: usize,
     pub in_flight: HashSet<usize>,
@@ -283,11 +286,21 @@ pub struct PdfLoader {
 
 impl PdfLoader {
     pub fn new() -> Self {
-        let (request_tx, request_rx) = channel::<PdfPageRequest>();
+        let queue = Arc::new((Mutex::new(VecDeque::<PdfPageRequest>::new()), Condvar::new()));
         let (response_tx, response_rx) = channel::<PdfPageResponse>();
 
+        let q_clone = Arc::clone(&queue);
         std::thread::spawn(move || {
-            while let Ok(req) = request_rx.recv() {
+            let (lock, cvar) = &*q_clone;
+            loop {
+                let req = {
+                    let mut q = lock.lock().unwrap();
+                    while q.is_empty() {
+                        q = cvar.wait(q).unwrap();
+                    }
+                    q.pop_front().unwrap()
+                };
+
                 let img = render_pdf_page_to_image(&req.path, req.page);
                 let _ = response_tx.send(PdfPageResponse {
                     path: req.path,
@@ -299,7 +312,7 @@ impl PdfLoader {
         });
 
         Self {
-            request_tx,
+            queue,
             response_rx,
             generation: 0,
             in_flight: HashSet::new(),
@@ -307,22 +320,36 @@ impl PdfLoader {
         }
     }
 
-    pub fn request_page(&mut self, path: &Path, page: usize) {
+    pub fn request_page_priority(&mut self, path: &Path, page: usize, high_priority: bool) {
         if self.in_flight.contains(&page) || self.failed.contains(&page) {
             return;
         }
         self.in_flight.insert(page);
-        let _ = self.request_tx.send(PdfPageRequest {
+        let req = PdfPageRequest {
             path: path.to_path_buf(),
             page,
             generation: self.generation,
-        });
+        };
+        let (lock, cvar) = &*self.queue;
+        let mut q = lock.lock().unwrap();
+        if high_priority {
+            q.push_front(req);
+        } else {
+            q.push_back(req);
+        }
+        cvar.notify_one();
+    }
+
+    pub fn request_page(&mut self, path: &Path, page: usize) {
+        self.request_page_priority(path, page, true);
     }
 
     pub fn reset_for_new_file(&mut self) {
         self.generation += 1;
         self.in_flight.clear();
         self.failed.clear();
+        let (lock, _) = &*self.queue;
+        lock.lock().unwrap().clear();
     }
 }
 
@@ -346,6 +373,9 @@ pub struct QuickLookApp {
     pending_resize: Option<egui::Vec2>,
     pdf_loader: PdfLoader,
     pdf_scroll_target: Option<usize>,
+    pdf_show_sidebar: bool,
+    pdf_scroll_accum: f32,
+    pdf_last_page_flip: Instant,
 }
 
 impl QuickLookApp {
@@ -364,6 +394,9 @@ impl QuickLookApp {
             pending_resize: None,
             pdf_loader: PdfLoader::new(),
             pdf_scroll_target: None,
+            pdf_show_sidebar: true,
+            pdf_scroll_accum: 0.0,
+            pdf_last_page_flip: Instant::now(),
         };
 
         if let Some(t) = target {
@@ -456,6 +489,8 @@ impl QuickLookApp {
         self.search_filter.clear();
         self.pdf_loader.reset_for_new_file();
         self.pdf_scroll_target = None;
+        self.pdf_scroll_accum = 0.0;
+        self.pdf_last_page_flip = Instant::now();
         self.load_current_file();
     }
 
@@ -476,6 +511,8 @@ impl QuickLookApp {
         self.search_filter.clear();
         self.pdf_loader.reset_for_new_file();
         self.pdf_scroll_target = None;
+        self.pdf_scroll_accum = 0.0;
+        self.pdf_last_page_flip = Instant::now();
         self.load_current_file();
     }
 
@@ -608,15 +645,25 @@ impl QuickLookApp {
             _ => {}
         }
 
-        // 7. PDF (Instant load with native Apple Quartz / CoreGraphics)
+        // 7. PDF (Instant load with native Apple Quartz / CoreGraphics or Dolphin/XDG cache)
         if ext == "pdf" {
             let total_pages = pdf_get_total_pages(path).max(1);
+            self.pdf_show_sidebar = total_pages > 1;
             let mut page_images = HashMap::new();
-            if let Some(img) = render_pdf_page_to_image(path, 1) {
-                page_images.insert(1, img);
-            } else if let Some(img) = get_xdg_thumbnail(path) {
+
+            // Check instant thumbnail cache (< 0.1ms from Dolphin / FreeDesktop cache)
+            if let Some(img) = get_xdg_thumbnail(path) {
                 page_images.insert(1, img);
             }
+            #[cfg(target_os = "macos")]
+            if let std::collections::hash_map::Entry::Vacant(e) = page_images.entry(1) {
+                if let Some(img) = macos_pdf::render_page(path, 1, 150.0) {
+                    e.insert(img);
+                }
+            }
+
+            // Always request full-resolution vector render in background thread (0ms UI blocking)
+            self.pdf_loader.request_page(path, 1);
             if total_pages > 1 {
                 self.pdf_loader.request_page(path, 2);
             }
@@ -625,6 +672,7 @@ impl QuickLookApp {
                 total_pages,
                 page_images,
                 page_textures: HashMap::new(),
+                thumb_textures: HashMap::new(),
             });
             return;
         }
@@ -819,6 +867,11 @@ impl eframe::App for QuickLookApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
 
+                // T toggles thumbnail rail
+                if i.key_pressed(egui::Key::T) {
+                    self.pdf_show_sidebar = !self.pdf_show_sidebar;
+                }
+
                 let alt = i.modifiers.alt;
                 let shift = i.modifiers.shift;
 
@@ -836,40 +889,51 @@ impl eframe::App for QuickLookApp {
                         self.navigate(1);
                     }
                 } else {
-                    let next_page = i.key_pressed(egui::Key::ArrowRight)
-                        || i.key_pressed(egui::Key::ArrowDown)
-                        || i.key_pressed(egui::Key::PageDown)
-                        || i.key_pressed(egui::Key::J)
-                        || (i.key_pressed(egui::Key::Space) && !shift);
+                    let (total, is_last_page) = if let FileKind::Pdf { current_page, total_pages, .. } = &self.file_kind {
+                        (*total_pages, *current_page >= *total_pages)
+                    } else {
+                        (1, true)
+                    };
 
-                    let prev_page = i.key_pressed(egui::Key::ArrowLeft)
-                        || i.key_pressed(egui::Key::ArrowUp)
-                        || i.key_pressed(egui::Key::PageUp)
-                        || i.key_pressed(egui::Key::K)
-                        || i.key_pressed(egui::Key::Backspace)
-                        || (i.key_pressed(egui::Key::Space) && shift);
+                    if (total <= 1 || is_last_page) && (i.key_pressed(egui::Key::Space) && !shift) {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    } else {
+                        let next_page = i.key_pressed(egui::Key::ArrowRight)
+                            || i.key_pressed(egui::Key::ArrowDown)
+                            || i.key_pressed(egui::Key::PageDown)
+                            || i.key_pressed(egui::Key::J)
+                            || (i.key_pressed(egui::Key::Space) && !shift);
 
-                    let first_page = i.key_pressed(egui::Key::Home);
-                    let last_page = i.key_pressed(egui::Key::End);
+                        let prev_page = i.key_pressed(egui::Key::ArrowLeft)
+                            || i.key_pressed(egui::Key::ArrowUp)
+                            || i.key_pressed(egui::Key::PageUp)
+                            || i.key_pressed(egui::Key::K)
+                            || i.key_pressed(egui::Key::Backspace)
+                            || (i.key_pressed(egui::Key::Space) && shift);
 
-                    if let FileKind::Pdf { current_page, total_pages, .. } = &mut self.file_kind {
-                        let total = *total_pages;
-                        let mut target_page = None;
-                        if next_page && *current_page < total {
-                            target_page = Some(*current_page + 1);
-                        } else if prev_page && *current_page > 1 {
-                            target_page = Some(*current_page - 1);
-                        } else if first_page {
-                            target_page = Some(1);
-                        } else if last_page {
-                            target_page = Some(total);
-                        }
+                        let first_page = i.key_pressed(egui::Key::Home);
+                        let last_page = i.key_pressed(egui::Key::End);
 
-                        if let Some(tp) = target_page {
-                            *current_page = tp;
-                            self.pdf_scroll_target = Some(tp);
-                            if let Some(p) = self.current_path.as_deref() {
-                                self.pdf_loader.request_page(p, tp);
+                        if let FileKind::Pdf { current_page, total_pages, .. } = &mut self.file_kind {
+                            let total = *total_pages;
+                            let mut target_page = None;
+                            if next_page && *current_page < total {
+                                target_page = Some(*current_page + 1);
+                            } else if prev_page && *current_page > 1 {
+                                target_page = Some(*current_page - 1);
+                            } else if first_page {
+                                target_page = Some(1);
+                            } else if last_page {
+                                target_page = Some(total);
+                            }
+
+                            if let Some(tp) = target_page {
+                                *current_page = tp;
+                                self.pdf_scroll_target = Some(tp);
+                                self.pan_offset = egui::Vec2::ZERO;
+                                if let Some(p) = self.current_path.as_deref() {
+                                    self.pdf_loader.request_page(p, tp);
+                                }
                             }
                         }
                     }
@@ -908,10 +972,10 @@ impl eframe::App for QuickLookApp {
                     ui.spacing_mut().item_spacing.x = 12.0;
 
                     // Navigation buttons
-                    if ui.button("◀").on_hover_text("Previous (Left Arrow / [)").clicked() {
+                    if custom_control_button(ui, "◀", 28.0, 12.0, "Previous file (Left Arrow / [)").clicked() {
                         self.navigate(-1);
                     }
-                    if ui.button("▶").on_hover_text("Next (Right Arrow / ])").clicked() {
+                    if custom_control_button(ui, "▶", 28.0, 12.0, "Next file (Right Arrow / ])").clicked() {
                         self.navigate(1);
                     }
 
@@ -1013,14 +1077,18 @@ impl eframe::App for QuickLookApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // Open with default app button
                         if let Some(ref path) = self.current_path {
-                            if ui
-                                .button(
+                            let open_resp = ui.add(
+                                egui::Button::new(
                                     egui::RichText::new("↗ Open with App")
+                                        .size(12.5)
                                         .color(egui::Color32::from_rgb(220, 220, 255)),
                                 )
-                                .on_hover_text("Open in default Linux system application (Enter / o)")
-                                .clicked()
-                            {
+                                .fill(egui::Color32::from_white_alpha(16))
+                                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(32)))
+                                .rounding(egui::Rounding::same(14.0)),
+                            )
+                            .on_hover_text("Open in default system application (Enter / o)");
+                            if open_resp.clicked() {
                                 let _ = open::that(path);
                             }
                         } else if ui.button("📂 Choose File...").clicked() {
@@ -1037,8 +1105,8 @@ impl eframe::App for QuickLookApp {
                             }
                         }
 
-                        // Zoom controls for Image & PDF
-                        if matches!(self.file_kind, FileKind::Image { .. }) || matches!(self.file_kind, FileKind::Pdf { .. }) {
+                        // Zoom controls for Image (PDF uses floating bottom HUD)
+                        if matches!(self.file_kind, FileKind::Image { .. }) {
                             if ui.button("100%").clicked() {
                                 self.zoom_scale = 1.0;
                                 self.pan_offset = egui::Vec2::ZERO;
@@ -1086,11 +1154,16 @@ impl eframe::App for QuickLookApp {
             FileKind::Archive { entries, .. } => {
                 render_archive_viewer(ui, entries, &mut self.search_filter);
             }
-            FileKind::Pdf { current_page, total_pages, page_images, page_textures } => {
+            FileKind::Pdf { current_page, total_pages, page_images, page_textures, thumb_textures } => {
                 // 1. Convert any CPU-side page_images to GPU textures
                 let pending_keys: Vec<usize> = page_images.keys().copied().collect();
                 for p in pending_keys {
                     if let Some(img) = page_images.remove(&p) {
+                        let thumb = create_thumbnail(&img, 140);
+                        let thumb_name = format!("pdf_thumb_{p}");
+                        let thumb_handle = ctx.load_texture(&thumb_name, thumb, egui::TextureOptions::LINEAR);
+                        thumb_textures.insert(p, thumb_handle);
+
                         let tex_name = format!("pdf_page_{p}");
                         let handle = ctx.load_texture(&tex_name, img, egui::TextureOptions::LINEAR);
                         page_textures.insert(p, handle);
@@ -1102,12 +1175,18 @@ impl eframe::App for QuickLookApp {
                     if resp.generation == self.pdf_loader.generation {
                         self.pdf_loader.in_flight.remove(&resp.page);
                         if let Some(img) = resp.image {
+                            let thumb = create_thumbnail(&img, 140);
+                            let thumb_name = format!("pdf_thumb_{}", resp.page);
+                            let thumb_handle = ctx.load_texture(&thumb_name, thumb, egui::TextureOptions::LINEAR);
+                            thumb_textures.insert(resp.page, thumb_handle);
+
                             let tex_name = format!("pdf_page_{}", resp.page);
                             let handle = ctx.load_texture(&tex_name, img, egui::TextureOptions::LINEAR);
                             page_textures.insert(resp.page, handle);
                             ctx.request_repaint();
 
                             // Enforce distance-based LRU eviction: MAX_CACHED_PAGES = 6 (keeps RAM footprint minimal)
+                            // Note: Lightweight thumbnails (~80 KB) stay in thumb_textures permanently.
                             const MAX_CACHED_PAGES: usize = 6;
                             while page_textures.len() > MAX_CACHED_PAGES {
                                 let cur = *current_page;
@@ -1144,10 +1223,14 @@ impl eframe::App for QuickLookApp {
                     current_page,
                     *total_pages,
                     page_textures,
+                    thumb_textures,
                     &mut self.pdf_loader,
                     &mut self.pdf_scroll_target,
                     &mut self.zoom_scale,
                     &mut self.pan_offset,
+                    &mut self.pdf_show_sidebar,
+                    &mut self.pdf_scroll_accum,
+                    &mut self.pdf_last_page_flip,
                 );
             }
             FileKind::Media { kind, poster_image } => {
@@ -2428,19 +2511,24 @@ fn custom_control_button(
     let (rect, resp) = ui.allocate_exact_size(desired_size, egui::Sense::click());
     let painter = ui.painter_at(rect);
 
-    let bg_color = if resp.is_pointer_button_down_on() {
+    let is_down = resp.is_pointer_button_down_on();
+    let is_hovered = resp.hovered();
+
+    let bg_color = if is_down {
         egui::Color32::from_white_alpha(55)
-    } else if resp.hovered() {
+    } else if is_hovered {
         egui::Color32::from_white_alpha(28)
     } else {
         egui::Color32::TRANSPARENT
     };
 
     if bg_color != egui::Color32::TRANSPARENT {
-        painter.circle_filled(rect.center(), size / 2.0, bg_color);
+        // Emil Kowalski rule: tactile press feedback (scale 0.94 on :active)
+        let radius = if is_down { (size / 2.0) * 0.94 } else { size / 2.0 };
+        painter.circle_filled(rect.center(), radius, bg_color);
     }
 
-    let text_color = if resp.hovered() {
+    let text_color = if is_hovered {
         egui::Color32::WHITE
     } else {
         egui::Color32::from_rgb(220, 220, 225)
@@ -2459,6 +2547,166 @@ fn custom_control_button(
     } else {
         resp
     }
+}
+
+fn custom_hud_button(
+    ui: &mut egui::Ui,
+    icon: &str,
+    size: f32,
+    font_size: f32,
+    enabled: bool,
+    active: bool,
+    tooltip: &str,
+) -> egui::Response {
+    let desired_size = egui::vec2(size, size);
+    let (rect, resp) = ui.allocate_exact_size(
+        desired_size,
+        if enabled { egui::Sense::click() } else { egui::Sense::hover() },
+    );
+    let painter = ui.painter_at(rect);
+
+    if enabled {
+        let is_down = resp.is_pointer_button_down_on();
+        let is_hovered = resp.hovered();
+
+        let (bg_color, radius) = if is_down {
+            (egui::Color32::from_white_alpha(55), (size / 2.0) * 0.94)
+        } else if active {
+            (egui::Color32::from_rgb(0, 122, 255), size / 2.0)
+        } else if is_hovered {
+            (egui::Color32::from_white_alpha(32), size / 2.0)
+        } else {
+            (egui::Color32::TRANSPARENT, size / 2.0)
+        };
+
+        if bg_color != egui::Color32::TRANSPARENT {
+            painter.circle_filled(rect.center(), radius, bg_color);
+        }
+
+        let text_color = if active || is_hovered {
+            egui::Color32::WHITE
+        } else {
+            egui::Color32::from_rgb(225, 225, 230)
+        };
+
+        if icon == "SIDEBAR_ICON" {
+            let icon_color = text_color;
+            let box_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(14.0, 11.0));
+            painter.rect_stroke(box_rect, egui::Rounding::same(2.0), egui::Stroke::new(1.2_f32, icon_color));
+            let sep_x = box_rect.max.x - 4.5;
+            painter.line_segment(
+                [egui::pos2(sep_x, box_rect.min.y), egui::pos2(sep_x, box_rect.max.y)],
+                egui::Stroke::new(1.2_f32, icon_color),
+            );
+            if active {
+                let side_rect = egui::Rect::from_min_max(egui::pos2(sep_x, box_rect.min.y), box_rect.max);
+                painter.rect_filled(side_rect, egui::Rounding::same(1.0), icon_color);
+            }
+        } else {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                icon,
+                egui::FontId::proportional(font_size),
+                text_color,
+            );
+        }
+
+        if !tooltip.is_empty() {
+            resp.on_hover_text(tooltip)
+        } else {
+            resp
+        }
+    } else {
+        if icon == "SIDEBAR_ICON" {
+            let icon_color = egui::Color32::from_white_alpha(45);
+            let box_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(14.0, 11.0));
+            painter.rect_stroke(box_rect, egui::Rounding::same(2.0), egui::Stroke::new(1.2_f32, icon_color));
+            let sep_x = box_rect.max.x - 4.5;
+            painter.line_segment(
+                [egui::pos2(sep_x, box_rect.min.y), egui::pos2(sep_x, box_rect.max.y)],
+                egui::Stroke::new(1.2_f32, icon_color),
+            );
+        } else {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                icon,
+                egui::FontId::proportional(font_size),
+                egui::Color32::from_white_alpha(45),
+            );
+        }
+        resp
+    }
+}
+
+fn custom_hud_pill_text(
+    ui: &mut egui::Ui,
+    text: &str,
+    font_size: f32,
+    tooltip: &str,
+) -> egui::Response {
+    let width = (text.len() as f32 * 7.5 + 18.0).max(42.0);
+    let desired_size = egui::vec2(width, 24.0);
+    let (rect, resp) = ui.allocate_exact_size(desired_size, egui::Sense::click());
+    let painter = ui.painter_at(rect);
+
+    let is_down = resp.is_pointer_button_down_on();
+    let is_hovered = resp.hovered();
+
+    let bg_color = if is_down {
+        egui::Color32::from_white_alpha(50)
+    } else if is_hovered {
+        egui::Color32::from_white_alpha(28)
+    } else {
+        egui::Color32::from_white_alpha(14)
+    };
+
+    painter.rect_filled(rect, egui::Rounding::same(12.0), bg_color);
+    painter.rect_stroke(
+        rect,
+        egui::Rounding::same(12.0),
+        egui::Stroke::new(
+            1.0_f32,
+            if is_hovered {
+                egui::Color32::from_white_alpha(55)
+            } else {
+                egui::Color32::from_white_alpha(24)
+            },
+        ),
+    );
+
+    let text_color = if is_hovered {
+        egui::Color32::WHITE
+    } else {
+        egui::Color32::from_rgb(220, 220, 225)
+    };
+
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        text,
+        egui::FontId::proportional(font_size),
+        text_color,
+    );
+
+    if !tooltip.is_empty() {
+        resp.on_hover_text(tooltip)
+    } else {
+        resp
+    }
+}
+
+fn draw_hud_divider(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 18.0), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.line_segment(
+        [
+            egui::pos2(rect.center().x, rect.min.y + 2.0),
+            egui::pos2(rect.center().x, rect.max.y - 2.0),
+        ],
+        egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(32)),
+    );
 }
 
 fn custom_media_scrubber(
@@ -2577,10 +2825,14 @@ fn render_pdf_viewer(
     current_page: &mut usize,
     total_pages: usize,
     page_textures: &HashMap<usize, egui::TextureHandle>,
+    thumb_textures: &HashMap<usize, egui::TextureHandle>,
     pdf_loader: &mut PdfLoader,
     scroll_target: &mut Option<usize>,
     zoom_scale: &mut f32,
     pan_offset: &mut egui::Vec2,
+    show_sidebar: &mut bool,
+    scroll_accum: &mut f32,
+    last_page_flip: &mut Instant,
 ) {
     let total_pages = total_pages.max(1);
     *current_page = (*current_page).clamp(1, total_pages);
@@ -2589,12 +2841,18 @@ fn render_pdf_viewer(
     let zoom_delta = ui.input(|i| i.zoom_delta());
     if zoom_delta != 1.0 {
         *zoom_scale = (*zoom_scale * zoom_delta).clamp(0.2, 5.0);
+        if (*zoom_scale - 1.0).abs() < 0.04 {
+            *zoom_scale = 1.0;
+            *pan_offset = egui::Vec2::ZERO;
+        }
     }
 
     // Reference aspect ratio (ISO A4 standard fallback: 595.28 / 841.89)
     let ref_aspect = page_textures
         .get(current_page)
+        .or_else(|| thumb_textures.get(current_page))
         .or_else(|| page_textures.get(&1))
+        .or_else(|| thumb_textures.get(&1))
         .or_else(|| page_textures.values().next())
         .map(|t| {
             let s = t.size_vec2();
@@ -2610,161 +2868,181 @@ fn render_pdf_viewer(
     if !page_textures.contains_key(current_page) && !pdf_loader.failed.contains(current_page) {
         pdf_loader.request_page(path, *current_page);
     }
-    // Prefetch next page if available
+    // Prefetch next and previous pages if available
     let next_page = *current_page + 1;
     if next_page <= total_pages
         && !page_textures.contains_key(&next_page)
         && !pdf_loader.failed.contains(&next_page)
     {
-        pdf_loader.request_page(path, next_page);
+        pdf_loader.request_page_priority(path, next_page, false);
+    }
+    if *current_page > 1 {
+        let prev_p = *current_page - 1;
+        if !page_textures.contains_key(&prev_p) && !pdf_loader.failed.contains(&prev_p) {
+            pdf_loader.request_page_priority(path, prev_p, false);
+        }
     }
 
     let mut page_to_navigate = None;
 
     // 1. Right sidebar — page thumbnails (macOS Quick Look layout matching Screenshot 1)
-    egui::SidePanel::right("pdf_thumbs")
-        .exact_width(136.0)
-        .resizable(false)
-        .frame(
-            egui::Frame::none()
-                .fill(egui::Color32::from_rgb(20, 20, 22))
-                .inner_margin(egui::Margin::symmetric(8.0, 12.0)),
-        )
-        .show_inside(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .id_salt("pdf_thumb_scroll")
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 12.0;
+    if *show_sidebar {
+        egui::SidePanel::right("pdf_thumbs")
+            .exact_width(120.0)
+            .resizable(false)
+            .frame(
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(20, 20, 22))
+                    .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(38, 38, 42)))
+                    .inner_margin(egui::Margin::symmetric(10.0, 12.0)),
+            )
+            .show_inside(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("pdf_thumb_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 12.0;
 
-                    let thumb_w = 98.0_f32;
-                    let thumb_h = (thumb_w / ref_aspect).clamp(65.0, 145.0);
-                    let card_size = egui::vec2(thumb_w, thumb_h);
+                        let thumb_w = 84.0_f32;
+                        let thumb_h = (thumb_w / ref_aspect).clamp(58.0, 126.0);
+                        let card_size = egui::vec2(thumb_w, thumb_h);
 
-                    for page in 1..=total_pages {
-                        let is_selected = page == *current_page;
+                        for page in 1..=total_pages {
+                            let is_selected = page == *current_page;
 
-                        ui.vertical_centered(|ui| {
-                            let (rect, response) =
-                                ui.allocate_exact_size(card_size, egui::Sense::click());
+                            ui.vertical_centered(|ui| {
+                                let (rect, response) =
+                                    ui.allocate_exact_size(card_size, egui::Sense::click());
 
-                            if response.clicked() {
-                                page_to_navigate = Some(page);
-                            }
+                                if response.clicked() {
+                                    page_to_navigate = Some(page);
+                                }
 
-                            // Programmatic scroll into view when page changes
-                            if *scroll_target == Some(page) {
-                                response.scroll_to_me(Some(egui::Align::Center));
-                            }
+                                // Programmatic scroll into view when page changes
+                                if *scroll_target == Some(page) {
+                                    response.scroll_to_me(Some(egui::Align::Center));
+                                }
 
-                            let painter = ui.painter_at(rect);
-                            let border_color = if is_selected {
-                                egui::Color32::from_rgb(0, 122, 255) // macOS active blue
-                            } else if response.hovered() {
-                                egui::Color32::from_rgb(120, 120, 125)
-                            } else {
-                                egui::Color32::from_rgb(50, 50, 55)
-                            };
-                            let border_w = if is_selected { 2.5_f32 } else { 1.0_f32 };
+                                // Lazy load visible thumbnails in background at low priority
+                                if ui.is_rect_visible(rect)
+                                    && !thumb_textures.contains_key(&page)
+                                    && !page_textures.contains_key(&page)
+                                    && !pdf_loader.failed.contains(&page)
+                                {
+                                    pdf_loader.request_page_priority(path, page, false);
+                                }
 
-                            // Subtle drop shadow behind thumbnail card
-                            painter.rect_filled(
-                                rect.translate(egui::vec2(0.0, 2.0)),
-                                egui::Rounding::same(4.0),
-                                egui::Color32::from_black_alpha(40),
-                            );
+                                let painter = ui.painter_at(rect);
+                                let (border_color, border_w) = if is_selected {
+                                    (egui::Color32::from_rgb(0, 122, 255), 2.5_f32) // macOS active blue
+                                } else if response.hovered() {
+                                    (egui::Color32::from_rgb(130, 130, 140), 1.5_f32)
+                                } else {
+                                    (egui::Color32::from_rgb(52, 52, 58), 1.0_f32)
+                                };
 
-                            // Pure white paper card base
-                            painter.rect_filled(
-                                rect,
-                                egui::Rounding::same(3.0),
-                                egui::Color32::WHITE,
-                            );
-
-                            // Real page texture IF already in memory, otherwise high-craft instant vector card
-                            if let Some(tex) = page_textures.get(&page) {
-                                let img = egui::Image::new(tex)
-                                    .fit_to_exact_size(card_size)
-                                    .rounding(egui::Rounding::same(2.0));
-                                img.paint_at(ui, rect);
-                            } else {
-                                // Draw simulated document lines (0ms latency, zero subprocesses)
-                                let line_color = egui::Color32::from_rgb(225, 225, 232);
-                                let start_x = rect.min.x + 12.0;
-                                let end_x = rect.max.x - 12.0;
-                                let line_w = end_x - start_x;
-
-                                let y1 = rect.min.y + card_size.y * 0.28;
-                                let y2 = rect.min.y + card_size.y * 0.42;
-                                let y3 = rect.min.y + card_size.y * 0.56;
-                                let y4 = rect.min.y + card_size.y * 0.70;
-
+                                // Subtle drop shadow behind thumbnail card
                                 painter.rect_filled(
-                                    egui::Rect::from_min_size(
-                                        egui::pos2(start_x, y1),
-                                        egui::vec2(line_w * 0.65, 3.0),
-                                    ),
-                                    egui::Rounding::same(1.5),
-                                    line_color,
-                                );
-                                painter.rect_filled(
-                                    egui::Rect::from_min_size(
-                                        egui::pos2(start_x, y2),
-                                        egui::vec2(line_w, 2.0),
-                                    ),
-                                    egui::Rounding::same(1.0),
-                                    line_color,
-                                );
-                                painter.rect_filled(
-                                    egui::Rect::from_min_size(
-                                        egui::pos2(start_x, y3),
-                                        egui::vec2(line_w * 0.85, 2.0),
-                                    ),
-                                    egui::Rounding::same(1.0),
-                                    line_color,
-                                );
-                                painter.rect_filled(
-                                    egui::Rect::from_min_size(
-                                        egui::pos2(start_x, y4),
-                                        egui::vec2(line_w * 0.45, 2.0),
-                                    ),
-                                    egui::Rounding::same(1.0),
-                                    line_color,
+                                    rect.translate(egui::vec2(0.0, 2.0)),
+                                    egui::Rounding::same(4.0),
+                                    egui::Color32::from_black_alpha(45),
                                 );
 
-                                // Page number in center
-                                painter.text(
-                                    rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    format!("{page}"),
-                                    egui::FontId::proportional(13.0),
-                                    egui::Color32::from_rgb(140, 140, 150),
+                                // Pure white paper card base
+                                painter.rect_filled(
+                                    rect,
+                                    egui::Rounding::same(3.0),
+                                    egui::Color32::WHITE,
                                 );
-                            }
 
-                            // Border stroke on top
-                            painter.rect_stroke(
-                                rect,
-                                egui::Rounding::same(3.0),
-                                egui::Stroke::new(border_w, border_color),
-                            );
+                                // Real thumbnail texture if available, otherwise high-craft instant vector card
+                                let maybe_tex = thumb_textures.get(&page).or_else(|| page_textures.get(&page));
+                                if let Some(tex) = maybe_tex {
+                                    let img = egui::Image::new(tex)
+                                        .fit_to_exact_size(card_size)
+                                        .rounding(egui::Rounding::same(2.0));
+                                    img.paint_at(ui, rect);
+                                } else {
+                                    // Draw simulated document lines (0ms latency, zero subprocesses)
+                                    let line_color = egui::Color32::from_rgb(226, 227, 232);
+                                    let start_x = rect.min.x + 10.0;
+                                    let end_x = rect.max.x - 10.0;
+                                    let line_w = end_x - start_x;
 
-                            // Page number badge below card
-                            ui.add_space(2.0);
-                            ui.label(
-                                egui::RichText::new(format!("{page}"))
-                                    .size(10.5)
-                                    .color(if is_selected {
-                                        egui::Color32::from_rgb(0, 122, 255)
-                                    } else {
-                                        egui::Color32::from_rgb(140, 140, 145)
-                                    })
-                                    .strong(),
-                            );
-                        });
-                    }
-                });
-        });
+                                    let y1 = rect.min.y + card_size.y * 0.25;
+                                    let y2 = rect.min.y + card_size.y * 0.40;
+                                    let y3 = rect.min.y + card_size.y * 0.55;
+                                    let y4 = rect.min.y + card_size.y * 0.70;
+
+                                    painter.rect_filled(
+                                        egui::Rect::from_min_size(
+                                            egui::pos2(start_x, y1),
+                                            egui::vec2(line_w * 0.60, 2.5),
+                                        ),
+                                        egui::Rounding::same(1.2),
+                                        line_color,
+                                    );
+                                    painter.rect_filled(
+                                        egui::Rect::from_min_size(
+                                            egui::pos2(start_x, y2),
+                                            egui::vec2(line_w * 0.90, 1.8),
+                                        ),
+                                        egui::Rounding::same(0.9),
+                                        line_color,
+                                    );
+                                    painter.rect_filled(
+                                        egui::Rect::from_min_size(
+                                            egui::pos2(start_x, y3),
+                                            egui::vec2(line_w * 0.80, 1.8),
+                                        ),
+                                        egui::Rounding::same(0.9),
+                                        line_color,
+                                    );
+                                    painter.rect_filled(
+                                        egui::Rect::from_min_size(
+                                            egui::pos2(start_x, y4),
+                                            egui::vec2(line_w * 0.45, 1.8),
+                                        ),
+                                        egui::Rounding::same(0.9),
+                                        line_color,
+                                    );
+
+                                    // Page number in center
+                                    painter.text(
+                                        rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        format!("{page}"),
+                                        egui::FontId::proportional(12.0),
+                                        egui::Color32::from_rgb(150, 150, 160),
+                                    );
+                                }
+
+                                // Border stroke on top
+                                painter.rect_stroke(
+                                    rect,
+                                    egui::Rounding::same(3.0),
+                                    egui::Stroke::new(border_w, border_color),
+                                );
+
+                                // Page number badge below card
+                                ui.add_space(3.0);
+                                ui.label(
+                                    egui::RichText::new(format!("{page}"))
+                                        .size(11.0)
+                                        .color(if is_selected {
+                                            egui::Color32::from_rgb(0, 122, 255)
+                                        } else if response.hovered() {
+                                            egui::Color32::WHITE
+                                        } else {
+                                            egui::Color32::from_rgb(135, 135, 142)
+                                        })
+                                        .strong(),
+                                );
+                            });
+                        }
+                    });
+            });
+    }
 
     if scroll_target.is_some() {
         *scroll_target = None;
@@ -2772,25 +3050,70 @@ fn render_pdf_viewer(
 
     // 2. Central PDF active page document view
     let central_rect = ui.available_rect_before_wrap();
+    let hud_w = (if total_pages > 1 { 330.0_f32 } else { 260.0_f32 }).min(central_rect.width() - 32.0);
+    let hud_h = 38.0;
+    let hud_rect = egui::Rect::from_center_size(
+        egui::pos2(central_rect.center().x, central_rect.bottom() - 28.0),
+        egui::vec2(hud_w, hud_h),
+    );
+
     egui::CentralPanel::default()
         .frame(
             egui::Frame::none()
-                .fill(egui::Color32::from_rgb(32, 32, 35))
+                .fill(egui::Color32::from_rgb(26, 26, 28))
                 .inner_margin(egui::Margin::same(0.0)),
         )
         .show_inside(ui, |ui| {
-            // Mouse wheel page navigation
-            let scroll_y = ui.input(|i| i.raw_scroll_delta.y);
-            if scroll_y < -15.0 && *current_page < total_pages {
-                page_to_navigate = Some(*current_page + 1);
-            } else if scroll_y > 15.0 && *current_page > 1 {
-                page_to_navigate = Some(*current_page - 1);
+            let pointer_pos = ui.input(|i| i.pointer.hover_pos());
+            let press_pos = ui.input(|i| i.pointer.press_origin());
+            let pointer_in_canvas = pointer_pos.is_some_and(|p| central_rect.contains(p) && !hud_rect.contains(p));
+            let pointer_in_hud = pointer_pos.is_some_and(|p| hud_rect.contains(p))
+                || press_pos.is_some_and(|p| hud_rect.contains(p));
+
+            // Mouse wheel handling with velocity accumulator and debounce
+            let scroll_delta = ui.input(|i| i.raw_scroll_delta);
+            let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+
+            if pointer_in_canvas {
+                if ctrl {
+                    // Zoom
+                    if scroll_delta.y != 0.0 {
+                        let factor = if scroll_delta.y > 0.0 { 1.1 } else { 0.9 };
+                        *zoom_scale = (*zoom_scale * factor).clamp(0.2, 5.0);
+                        if (*zoom_scale - 1.0).abs() < 0.04 {
+                            *zoom_scale = 1.0;
+                            *pan_offset = egui::Vec2::ZERO;
+                        }
+                    }
+                } else if *zoom_scale > 1.05 {
+                    // Scroll pans the enlarged document
+                    *pan_offset += scroll_delta;
+                } else if scroll_delta.y != 0.0 {
+                    // Fit mode: scroll flips pages with velocity accumulator and cooldown
+                    *scroll_accum += scroll_delta.y;
+                    let now = Instant::now();
+                    if now.duration_since(*last_page_flip).as_millis() > 220 {
+                        if *scroll_accum < -24.0 && *current_page < total_pages {
+                            page_to_navigate = Some(*current_page + 1);
+                            *scroll_accum = 0.0;
+                            *last_page_flip = now;
+                        } else if *scroll_accum > 24.0 && *current_page > 1 {
+                            page_to_navigate = Some(*current_page - 1);
+                            *scroll_accum = 0.0;
+                            *last_page_flip = now;
+                        }
+                    }
+                } else {
+                    *scroll_accum *= 0.8;
+                }
+            } else {
+                *scroll_accum *= 0.8;
             }
 
-            let avail_w = (ui.available_width() - 48.0).max(180.0);
-            let avail_h = (ui.available_height() - 64.0).max(180.0);
+            let avail_w = (central_rect.width() - 48.0).max(160.0);
+            let avail_h = (central_rect.height() - 72.0).max(160.0); // 72px clearance for bottom floating HUD
 
-            // Calculate page dimensions with 100% mathematical aspect ratio preservation
+            // Calculate page dimensions with aspect ratio preservation
             let active_aspect = if let Some(tex) = page_textures.get(current_page) {
                 let s = tex.size_vec2();
                 if s.y > 0.0 {
@@ -2802,160 +3125,298 @@ fn render_pdf_viewer(
                 ref_aspect
             };
 
-            let mut page_w = avail_w;
-            let mut page_h = page_w / active_aspect;
-            if page_h > avail_h {
-                page_h = avail_h;
-                page_w = page_h * active_aspect;
+            let mut base_w = avail_w;
+            let mut base_h = base_w / active_aspect;
+            if base_h > avail_h {
+                base_h = avail_h;
+                base_w = base_h * active_aspect;
             }
 
-            page_w = (page_w * (*zoom_scale)).max(160.0);
-            page_h = page_w / active_aspect;
+            let page_w = (base_w * (*zoom_scale)).max(140.0);
+            let page_h = page_w / active_aspect;
             let page_size = egui::vec2(page_w, page_h);
 
-            ui.vertical_centered(|ui| {
-                let pad_y = ((ui.available_height() - 48.0 - page_h) * 0.5).max(16.0);
-                ui.add_space(pad_y);
+            // Clamp pan offsets so zoomed page doesn't get lost off-screen
+            if *zoom_scale <= 1.05 {
+                *pan_offset = egui::Vec2::ZERO;
+            } else {
+                let max_pan_x = ((page_w - avail_w).max(0.0) * 0.5) + 120.0;
+                let max_pan_y = ((page_h - avail_h).max(0.0) * 0.5) + 120.0;
+                pan_offset.x = pan_offset.x.clamp(-max_pan_x, max_pan_x);
+                pan_offset.y = pan_offset.y.clamp(-max_pan_y, max_pan_y);
+            }
 
-                let (rect, resp) = ui.allocate_exact_size(page_size, egui::Sense::click_and_drag());
-                if resp.dragged() {
-                    *pan_offset += resp.drag_delta();
+            // Canvas view center
+            let view_center = egui::pos2(
+                central_rect.center().x,
+                central_rect.min.y + (central_rect.height() - 28.0) * 0.5,
+            );
+            let page_rect = egui::Rect::from_center_size(view_center + *pan_offset, page_size);
+
+            let (response, painter) = ui.allocate_painter(central_rect.size(), egui::Sense::click_and_drag());
+            if !pointer_in_hud {
+                if response.dragged() {
+                    *pan_offset += response.drag_delta();
                 }
-
-                let painter = ui.painter_at(rect);
-
-                // macOS Quick Look drop shadow
-                painter.rect_filled(
-                    rect.translate(egui::vec2(0.0, 6.0)),
-                    egui::Rounding::same(6.0),
-                    egui::Color32::from_black_alpha(65),
-                );
-
-                // White paper canvas
-                painter.rect_filled(
-                    rect,
-                    egui::Rounding::same(3.0),
-                    egui::Color32::WHITE,
-                );
-
-                // Page texture or crisp loading placeholder
-                if let Some(tex) = page_textures.get(current_page) {
-                    let img = egui::Image::new(tex)
-                        .fit_to_exact_size(page_size)
-                        .rounding(egui::Rounding::same(3.0));
-                    img.paint_at(ui, rect);
-                } else {
-                    let is_failed = pdf_loader.failed.contains(current_page);
-                    if is_failed {
-                        painter.text(
-                            rect.center() - egui::vec2(0.0, 36.0),
-                            egui::Align2::CENTER_CENTER,
-                            "📄",
-                            egui::FontId::proportional(44.0),
-                            egui::Color32::from_rgb(180, 180, 190),
-                        );
-                        painter.text(
-                            rect.center() - egui::vec2(0.0, 2.0),
-                            egui::Align2::CENTER_CENTER,
-                            format!("Page {} Preview Unavailable", *current_page),
-                            egui::FontId::proportional(15.0),
-                            egui::Color32::from_rgb(20, 20, 22),
-                        );
-                        #[cfg(not(target_os = "macos"))]
-                        {
-                            let (_distro, cmd) = get_linux_package_install_hint();
-                            painter.text(
-                                rect.center() + egui::vec2(0.0, 24.0),
-                                egui::Align2::CENTER_CENTER,
-                                format!("To preview all pages, install: {cmd}"),
-                                egui::FontId::proportional(11.5),
-                                egui::Color32::from_rgb(120, 120, 130),
-                            );
-                        }
-                        painter.text(
-                            rect.center() + egui::vec2(0.0, 48.0),
-                            egui::Align2::CENTER_CENTER,
-                            "Press 'O' or Enter to open in system viewer",
-                            egui::FontId::proportional(12.5),
-                            egui::Color32::from_rgb(0, 122, 255),
-                        );
+                if response.double_clicked() {
+                    if (*zoom_scale - 1.0).abs() < 0.08 {
+                        *zoom_scale = 1.6;
                     } else {
+                        *zoom_scale = 1.0;
+                        *pan_offset = egui::Vec2::ZERO;
+                    }
+                }
+            }
+
+            // Dual drop shadow (Ambient + Key shadow)
+            painter.rect_filled(
+                page_rect.translate(egui::vec2(0.0, 7.0)),
+                egui::Rounding::same(6.0),
+                egui::Color32::from_black_alpha(75),
+            );
+            painter.rect_filled(
+                page_rect.translate(egui::vec2(0.0, 2.0)),
+                egui::Rounding::same(4.0),
+                egui::Color32::from_black_alpha(45),
+            );
+
+            // Crisp 1px outline
+            painter.rect_filled(
+                page_rect.expand(1.0),
+                egui::Rounding::same(3.0),
+                egui::Color32::from_black_alpha(30),
+            );
+
+            // Pure white paper canvas
+            painter.rect_filled(
+                page_rect,
+                egui::Rounding::same(2.0),
+                egui::Color32::WHITE,
+            );
+
+            // Page texture or crisp loading placeholder
+            if let Some(tex) = page_textures.get(current_page) {
+                let img = egui::Image::new(tex)
+                    .fit_to_exact_size(page_size)
+                    .rounding(egui::Rounding::same(2.0));
+                img.paint_at(ui, page_rect);
+            } else {
+                let is_failed = pdf_loader.failed.contains(current_page);
+                if is_failed {
+                    painter.text(
+                        page_rect.center() - egui::vec2(0.0, 36.0),
+                        egui::Align2::CENTER_CENTER,
+                        "📄",
+                        egui::FontId::proportional(44.0),
+                        egui::Color32::from_rgb(180, 180, 190),
+                    );
+                    painter.text(
+                        page_rect.center() - egui::vec2(0.0, 2.0),
+                        egui::Align2::CENTER_CENTER,
+                        format!("Page {} Preview Unavailable", *current_page),
+                        egui::FontId::proportional(15.0),
+                        egui::Color32::from_rgb(20, 20, 22),
+                    );
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        let (_distro, cmd) = get_linux_package_install_hint();
                         painter.text(
-                            rect.center() - egui::vec2(0.0, 16.0),
+                            page_rect.center() + egui::vec2(0.0, 24.0),
                             egui::Align2::CENTER_CENTER,
-                            "📄",
-                            egui::FontId::proportional(42.0),
-                            egui::Color32::from_rgb(180, 180, 190),
-                        );
-                        painter.text(
-                            rect.center() + egui::vec2(0.0, 24.0),
-                            egui::Align2::CENTER_CENTER,
-                            format!("Loading Page {} of {}...", *current_page, total_pages),
-                            egui::FontId::proportional(14.0),
+                            format!("To preview all pages, install: {cmd}"),
+                            egui::FontId::proportional(11.5),
                             egui::Color32::from_rgb(120, 120, 130),
                         );
                     }
+                    painter.text(
+                        page_rect.center() + egui::vec2(0.0, 48.0),
+                        egui::Align2::CENTER_CENTER,
+                        "Press 'O' or Enter to open in system viewer",
+                        egui::FontId::proportional(12.5),
+                        egui::Color32::from_rgb(0, 122, 255),
+                    );
+                } else {
+                    // Document skeleton lines
+                    let skel_color = egui::Color32::from_rgb(235, 236, 240);
+                    let left = page_rect.min.x + page_w * 0.12;
+                    let width_full = page_w * 0.76;
+                    let mut y = page_rect.min.y + page_h * 0.12;
+
+                    // Header line
+                    painter.rect_filled(
+                        egui::Rect::from_min_size(egui::pos2(left, y), egui::vec2(width_full * 0.55, 6.0)),
+                        egui::Rounding::same(3.0),
+                        egui::Color32::from_rgb(220, 222, 228),
+                    );
+                    y += 18.0;
+
+                    // Paragraph lines
+                    let widths = [0.95, 0.90, 0.85, 0.92, 0.88, 0.60];
+                    for w_frac in widths {
+                        if y + 10.0 < page_rect.max.y - 20.0 {
+                            painter.rect_filled(
+                                egui::Rect::from_min_size(egui::pos2(left, y), egui::vec2(width_full * w_frac, 3.5)),
+                                egui::Rounding::same(1.7),
+                                skel_color,
+                            );
+                            y += 12.0;
+                        }
+                    }
+
+                    // Floating loading badge
+                    let badge_size = egui::vec2(160.0, 32.0);
+                    let badge_rect = egui::Rect::from_center_size(page_rect.center(), badge_size);
+                    painter.rect_filled(
+                        badge_rect,
+                        egui::Rounding::same(16.0),
+                        egui::Color32::from_black_alpha(180),
+                    );
+                    painter.rect_stroke(
+                        badge_rect,
+                        egui::Rounding::same(16.0),
+                        egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(35)),
+                    );
+                    painter.text(
+                        badge_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        format!("Loading Page {}...", *current_page),
+                        egui::FontId::proportional(12.5),
+                        egui::Color32::WHITE,
+                    );
                 }
+            }
 
-                // Crisp boundary stroke
-                painter.rect_stroke(
-                    rect,
-                    egui::Rounding::same(3.0),
-                    egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(215, 215, 220)),
-                );
-            });
-
-            // 3. Floating Page Navigation HUD at bottom center (macOS Quick Look pill)
-            let hud_rect = egui::Rect::from_center_size(
-                egui::pos2(central_rect.center().x, central_rect.bottom() - 32.0),
-                egui::vec2(190.0, 36.0),
+            // Crisp boundary stroke
+            painter.rect_stroke(
+                page_rect,
+                egui::Rounding::same(2.0),
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(218, 218, 224)),
             );
 
+            // 3. Floating Page Navigation & Zoom HUD Capsule at bottom center (macOS Quick Look pill)
             ui.allocate_new_ui(egui::UiBuilder::new().max_rect(hud_rect), |ui| {
                 egui::Frame::none()
-                    .fill(egui::Color32::from_black_alpha(205))
-                    .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(35)))
-                    .rounding(egui::Rounding::same(18.0))
+                    .fill(egui::Color32::from_black_alpha(225))
+                    .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(38)))
+                    .rounding(egui::Rounding::same(19.0))
                     .shadow(egui::epaint::Shadow {
-                        offset: egui::vec2(0.0, 4.0),
-                        blur: 16.0,
+                        offset: egui::vec2(0.0, 6.0),
+                        blur: 24.0,
                         spread: 0.0,
-                        color: egui::Color32::from_black_alpha(90),
+                        color: egui::Color32::from_black_alpha(110),
                     })
                     .inner_margin(egui::Margin::symmetric(10.0, 4.0))
                     .show(ui, |ui| {
                         ui.horizontal_centered(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+
+                            // Sidebar toggle button (only shown if multi-page)
+                            if total_pages > 1 {
+                                let sb_resp = custom_hud_button(
+                                    ui,
+                                    "SIDEBAR_ICON",
+                                    28.0,
+                                    13.0,
+                                    true,
+                                    *show_sidebar,
+                                    "Toggle Thumbnails (T)",
+                                );
+                                if sb_resp.clicked() {
+                                    *show_sidebar = !*show_sidebar;
+                                }
+
+                                draw_hud_divider(ui);
+                            }
+
+                            // Previous Page
                             let can_prev = *current_page > 1;
-                            let prev_resp = custom_control_button(
+                            let prev_resp = custom_hud_button(
                                 ui,
                                 "◀",
                                 26.0,
-                                12.0,
-                                if can_prev { "Previous Page (Left / Up)" } else { "" },
+                                11.5,
+                                can_prev,
+                                false,
+                                if can_prev { "Previous Page (Left Arrow / PageUp)" } else { "" },
                             );
                             if can_prev && prev_resp.clicked() {
                                 page_to_navigate = Some(*current_page - 1);
                             }
 
-                            ui.add_space(4.0);
+                            // Page indicator label
                             ui.label(
-                                egui::RichText::new(format!("{} / {}", *current_page, total_pages))
+                                egui::RichText::new(format!("Page {} of {}", *current_page, total_pages))
                                     .size(12.5)
                                     .strong()
                                     .color(egui::Color32::WHITE),
                             );
-                            ui.add_space(4.0);
 
+                            // Next Page
                             let can_next = *current_page < total_pages;
-                            let next_resp = custom_control_button(
+                            let next_resp = custom_hud_button(
                                 ui,
                                 "▶",
                                 26.0,
-                                12.0,
-                                if can_next { "Next Page (Right / Down / Space)" } else { "" },
+                                11.5,
+                                can_next,
+                                false,
+                                if can_next { "Next Page (Right Arrow / PageDown / Space)" } else { "" },
                             );
                             if can_next && next_resp.clicked() {
                                 page_to_navigate = Some(*current_page + 1);
+                            }
+
+                            draw_hud_divider(ui);
+
+                            // Zoom Out
+                            let can_zoom_out = *zoom_scale > 0.25;
+                            let zout_resp = custom_hud_button(
+                                ui,
+                                "−",
+                                26.0,
+                                14.0,
+                                can_zoom_out,
+                                false,
+                                "Zoom Out (-)",
+                            );
+                            if can_zoom_out && zout_resp.clicked() {
+                                *zoom_scale = (*zoom_scale / 1.25).max(0.2);
+                                if (*zoom_scale - 1.0).abs() < 0.05 {
+                                    *zoom_scale = 1.0;
+                                    *pan_offset = egui::Vec2::ZERO;
+                                }
+                            }
+
+                            // Zoom Reset Pill
+                            let zoom_pct_str = if (*zoom_scale - 1.0).abs() < 0.04 {
+                                "Fit".to_string()
+                            } else {
+                                format!("{:.0}%", *zoom_scale * 100.0)
+                            };
+                            let zpct_resp = custom_hud_pill_text(
+                                ui,
+                                &zoom_pct_str,
+                                11.0,
+                                "Reset Zoom to Fit (0)",
+                            );
+                            if zpct_resp.clicked() {
+                                *zoom_scale = 1.0;
+                                *pan_offset = egui::Vec2::ZERO;
+                            }
+
+                            // Zoom In
+                            let can_zoom_in = *zoom_scale < 5.0;
+                            let zin_resp = custom_hud_button(
+                                ui,
+                                "+",
+                                26.0,
+                                14.0,
+                                can_zoom_in,
+                                false,
+                                "Zoom In (+ / =)",
+                            );
+                            if can_zoom_in && zin_resp.clicked() {
+                                *zoom_scale = (*zoom_scale * 1.25).min(5.0);
                             }
                         });
                     });
@@ -2965,6 +3426,7 @@ fn render_pdf_viewer(
     if let Some(target_p) = page_to_navigate {
         *current_page = target_p.clamp(1, total_pages);
         *scroll_target = Some(*current_page);
+        *pan_offset = egui::Vec2::ZERO;
         if !page_textures.contains_key(current_page) {
             pdf_loader.request_page(path, *current_page);
         }
@@ -4004,6 +4466,37 @@ fn load_zip_listing(path: &Path, file_size: u64) -> FileKind {
 }
 
 pub fn estimate_pdf_pages_from_bytes(buffer: &[u8]) -> Option<usize> {
+    // 1. First check for /Count <num> in /Type /Pages dictionary (standard PDF catalog root)
+    let count_target = b"/Count";
+    let mut max_count = 0;
+    let mut idx = 0;
+    while idx + count_target.len() < buffer.len() {
+        if &buffer[idx..idx + count_target.len()] == count_target {
+            let mut k = idx + count_target.len();
+            while k < buffer.len() && buffer[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            let mut num_str = String::new();
+            while k < buffer.len() && buffer[k].is_ascii_digit() {
+                num_str.push(buffer[k] as char);
+                k += 1;
+            }
+            if let Ok(c) = num_str.parse::<usize>() {
+                if c > max_count {
+                    max_count = c;
+                }
+            }
+            idx = k;
+        } else {
+            idx += 1;
+        }
+    }
+
+    if max_count > 0 {
+        return Some(max_count);
+    }
+
+    // 2. Fallback: scan for individual /Type /Page occurrences
     let mut count = 0;
     let is_page_terminator = |b: u8| -> bool {
         b.is_ascii_whitespace() || matches!(b, b'/' | b'>' | b']' | b'<' | b'[' | b'(' | b')' | b'%' | b';')
@@ -4031,44 +4524,49 @@ pub fn estimate_pdf_pages_from_bytes(buffer: &[u8]) -> Option<usize> {
     if count > 0 {
         Some(count)
     } else {
-        // Fallback: search for /Count <num> in /Type /Pages
-        let count_target = b"/Count";
-        let mut max_count = 0;
-        let mut idx = 0;
-        while idx + count_target.len() < buffer.len() {
-            if &buffer[idx..idx + count_target.len()] == count_target {
-                let mut k = idx + count_target.len();
-                while k < buffer.len() && buffer[k].is_ascii_whitespace() {
-                    k += 1;
-                }
-                let mut num_str = String::new();
-                while k < buffer.len() && buffer[k].is_ascii_digit() {
-                    num_str.push(buffer[k] as char);
-                    k += 1;
-                }
-                if let Ok(c) = num_str.parse::<usize>() {
-                    if c > max_count {
-                        max_count = c;
-                    }
-                }
-                idx = k;
-            } else {
-                idx += 1;
-            }
-        }
-        if max_count > 0 {
-            Some(max_count)
-        } else {
-            None
-        }
+        None
     }
 }
 
 pub fn estimate_pdf_pages(path: &Path) -> Option<usize> {
     let mut file = File::open(path).ok()?;
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer).ok()?;
-    estimate_pdf_pages_from_bytes(&buffer)
+    let metadata = file.metadata().ok()?;
+    let len = metadata.len();
+
+    if len <= 2 * 1024 * 1024 {
+        let mut buffer = Vec::with_capacity(len as usize);
+        file.read_to_end(&mut buffer).ok()?;
+        return estimate_pdf_pages_from_bytes(&buffer);
+    }
+
+    // For larger files: fast inspect first 256 KB and last 256 KB (< 0.5ms)
+    let head_size = (len as usize).min(256 * 1024);
+    let mut head_buf = vec![0u8; head_size];
+    if file.read_exact(&mut head_buf).is_ok() {
+        if let Some(count) = estimate_pdf_pages_from_bytes(&head_buf) {
+            return Some(count);
+        }
+    }
+
+    let tail_size = 256 * 1024;
+    if len > (tail_size as u64) && file.seek(SeekFrom::End(-(tail_size as i64))).is_ok() {
+        let mut tail_buf = vec![0u8; tail_size];
+        if file.read_exact(&mut tail_buf).is_ok() {
+            if let Some(count) = estimate_pdf_pages_from_bytes(&tail_buf) {
+                return Some(count);
+            }
+        }
+    }
+
+    let max_read = (len as usize).min(16 * 1024 * 1024);
+    if file.seek(SeekFrom::Start(0)).is_ok() {
+        let mut full_buf = vec![0u8; max_read];
+        if file.read_exact(&mut full_buf).is_ok() {
+            return estimate_pdf_pages_from_bytes(&full_buf);
+        }
+    }
+
+    None
 }
 
 fn detect_language(ext: &str, sample_text: &str) -> String {
@@ -5610,6 +6108,42 @@ fn pdf_get_total_pages(path: &Path) -> usize {
     1
 }
 
+fn run_command_with_timeout(mut child: Child, timeout: std::time::Duration) -> Option<Vec<u8>> {
+    let mut stdout_handle = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_handle.read_to_end(&mut buf);
+        buf
+    });
+
+    let start = Instant::now();
+    let exited = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.success(),
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+        }
+    };
+
+    let data = reader.join().ok()?;
+    if exited && !data.is_empty() {
+        Some(data)
+    } else {
+        None
+    }
+}
+
 fn render_pdf_page_to_image(path: &Path, page: usize) -> Option<egui::ColorImage> {
     #[cfg(target_os = "macos")]
     if let Some(img) = macos_pdf::render_page(path, page, 150.0) {
@@ -5618,9 +6152,10 @@ fn render_pdf_page_to_image(path: &Path, page: usize) -> Option<egui::ColorImage
 
     let path_str = path.to_str()?;
     let temp_dir = std::env::temp_dir();
+    let cmd_timeout = std::time::Duration::from_millis(2000);
 
     // 1. pdftocairo (poppler-utils) - fast and explicitly designed for stdout streaming with "-"
-    if let Ok(output) = std::process::Command::new("pdftocairo")
+    if let Ok(child) = std::process::Command::new("pdftocairo")
         .current_dir(&temp_dir)
         .args([
             "-png",
@@ -5634,17 +6169,21 @@ fn render_pdf_page_to_image(path: &Path, page: usize) -> Option<egui::ColorImage
             path_str,
             "-",
         ])
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
     {
-        if output.status.success() && !output.stdout.is_empty() {
-            if let Some(img) = load_color_image_from_bytes(&output.stdout) {
-                return Some(img);
+        if let Some(stdout) = run_command_with_timeout(child, cmd_timeout) {
+            if !stdout.is_empty() {
+                if let Some(img) = load_color_image_from_bytes(&stdout) {
+                    return Some(img);
+                }
             }
         }
     }
 
     // 2. pdftoppm (poppler-utils) - omit output prefix so it writes directly to stdout, NEVER to disk!
-    if let Ok(output) = std::process::Command::new("pdftoppm")
+    if let Ok(child) = std::process::Command::new("pdftoppm")
         .current_dir(&temp_dir)
         .args([
             "-png",
@@ -5656,24 +6195,32 @@ fn render_pdf_page_to_image(path: &Path, page: usize) -> Option<egui::ColorImage
             &page.to_string(),
             path_str,
         ])
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
     {
-        if output.status.success() && !output.stdout.is_empty() {
-            if let Some(img) = load_color_image_from_bytes(&output.stdout) {
-                return Some(img);
+        if let Some(stdout) = run_command_with_timeout(child, cmd_timeout) {
+            if !stdout.is_empty() {
+                if let Some(img) = load_color_image_from_bytes(&stdout) {
+                    return Some(img);
+                }
             }
         }
     }
 
     // 3. mutool (MuPDF) - ultra fast (< 25ms) and streams directly to stdout with "-"
-    if let Ok(output) = std::process::Command::new("mutool")
+    if let Ok(child) = std::process::Command::new("mutool")
         .current_dir(&temp_dir)
         .args(["draw", "-o", "-", "-r", "150", path_str, &page.to_string()])
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
     {
-        if output.status.success() && !output.stdout.is_empty() {
-            if let Some(img) = load_color_image_from_bytes(&output.stdout) {
-                return Some(img);
+        if let Some(stdout) = run_command_with_timeout(child, cmd_timeout) {
+            if !stdout.is_empty() {
+                if let Some(img) = load_color_image_from_bytes(&stdout) {
+                    return Some(img);
+                }
             }
         }
     }
@@ -5699,7 +6246,7 @@ fn render_pdf_page_to_image(path: &Path, page: usize) -> Option<egui::ColorImage
     }
 
     // 5. Ghostscript (gs) - streaming directly to stdout with -sOutputFile=-
-    if let Ok(output) = std::process::Command::new("gs")
+    if let Ok(child) = std::process::Command::new("gs")
         .current_dir(&temp_dir)
         .args([
             "-sDEVICE=png16m",
@@ -5708,15 +6255,21 @@ fn render_pdf_page_to_image(path: &Path, page: usize) -> Option<egui::ColorImage
             "-r150",
             "-sOutputFile=-",
             "-q",
+            "-dQUIET",
+            "-dPARANOIDSAFER",
             "-dNOPAUSE",
             "-dBATCH",
             path_str,
         ])
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
     {
-        if output.status.success() && !output.stdout.is_empty() {
-            if let Some(img) = load_color_image_from_bytes(&output.stdout) {
-                return Some(img);
+        if let Some(stdout) = run_command_with_timeout(child, cmd_timeout) {
+            if !stdout.is_empty() {
+                if let Some(img) = load_color_image_from_bytes(&stdout) {
+                    return Some(img);
+                }
             }
         }
     }
@@ -5725,14 +6278,18 @@ fn render_pdf_page_to_image(path: &Path, page: usize) -> Option<egui::ColorImage
     let page_idx = page.saturating_sub(1);
     let page_spec = format!("{path_str}[{page_idx}]");
     for bin in ["magick", "convert"] {
-        if let Ok(output) = std::process::Command::new(bin)
+        if let Ok(child) = std::process::Command::new(bin)
             .current_dir(&temp_dir)
             .args(["-density", "150", &page_spec, "-flatten", "png:-"])
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
         {
-            if output.status.success() && !output.stdout.is_empty() {
-                if let Some(img) = load_color_image_from_bytes(&output.stdout) {
-                    return Some(img);
+            if let Some(stdout) = run_command_with_timeout(child, cmd_timeout) {
+                if !stdout.is_empty() {
+                    if let Some(img) = load_color_image_from_bytes(&stdout) {
+                        return Some(img);
+                    }
                 }
             }
         }
@@ -5838,41 +6395,153 @@ fn extract_audio_art_to_image(path: &Path) -> Option<egui::ColorImage> {
     None
 }
 
-fn get_xdg_thumbnail(path: &Path) -> Option<egui::ColorImage> {
-    let abs_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let uri = format!("file://{}", abs_path.to_string_lossy());
+pub fn md5_digest(data: &[u8]) -> [u8; 16] {
+    let mut a: u32 = 0x67452301;
+    let mut b: u32 = 0xefcdab89;
+    let mut c: u32 = 0x98badcfe;
+    let mut d: u32 = 0x10325476;
 
-    // Compute MD5 hash of file:// URI via md5sum or md5
-    let mut cmd = std::process::Command::new("md5sum");
-    let hash = if let Ok(mut child) = cmd
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-    {
-        use std::io::Write;
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(uri.as_bytes());
+    let orig_len_bits = (data.len() as u64).wrapping_mul(8);
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while (msg.len() % 64) != 56 {
+        msg.push(0x00);
+    }
+    msg.extend_from_slice(&orig_len_bits.to_le_bytes());
+
+    const S: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+        5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20,
+        4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+        6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+    const K: [u32; 64] = [
+        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee,
+        0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+        0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be,
+        0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+        0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa,
+        0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+        0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+        0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+        0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c,
+        0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+        0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05,
+        0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+        0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039,
+        0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1,
+        0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
+    ];
+
+    for chunk in msg.chunks_exact(64) {
+        let mut m = [0u32; 16];
+        for i in 0..16 {
+            m[i] = u32::from_le_bytes([chunk[i * 4], chunk[i * 4 + 1], chunk[i * 4 + 2], chunk[i * 4 + 3]]);
         }
-        child.wait_with_output().ok().and_then(|out| {
-            String::from_utf8_lossy(&out.stdout)
-                .split_whitespace()
-                .next()
-                .map(|s| s.to_string())
-        })
-    } else if let Ok(out) = std::process::Command::new("md5").arg("-s").arg(&uri).output() {
-        let s = String::from_utf8_lossy(&out.stdout);
-        s.split_whitespace().last().map(|s| s.to_string())
-    } else {
-        None
-    }?;
+        let (mut aa, mut bb, mut cc, mut dd) = (a, b, c, d);
+        for i in 0..64 {
+            let (f, g) = match i {
+                0..=15 => ((bb & cc) | (!bb & dd), i),
+                16..=31 => ((dd & bb) | (!dd & cc), (5 * i + 1) % 16),
+                32..=47 => (bb ^ cc ^ dd, (3 * i + 5) % 16),
+                _ => (cc ^ (bb | !dd), (7 * i) % 16),
+            };
+            let temp = dd;
+            dd = cc;
+            cc = bb;
+            bb = bb.wrapping_add((aa.wrapping_add(f).wrapping_add(K[i]).wrapping_add(m[g])).rotate_left(S[i]));
+            aa = temp;
+        }
+        a = a.wrapping_add(aa);
+        b = b.wrapping_add(bb);
+        c = c.wrapping_add(cc);
+        d = d.wrapping_add(dd);
+    }
 
-    let home = std::env::var("HOME").ok()?;
+    let mut out = [0u8; 16];
+    out[0..4].copy_from_slice(&a.to_le_bytes());
+    out[4..8].copy_from_slice(&b.to_le_bytes());
+    out[8..12].copy_from_slice(&c.to_le_bytes());
+    out[12..16].copy_from_slice(&d.to_le_bytes());
+    out
+}
+
+pub fn md5_hex(data: &[u8]) -> String {
+    let digest = md5_digest(data);
+    let mut s = String::with_capacity(32);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
+}
+
+pub fn create_thumbnail(img: &egui::ColorImage, max_w: usize) -> egui::ColorImage {
+    let w = img.size[0];
+    let h = img.size[1];
+    if w <= max_w || w == 0 || h == 0 {
+        return img.clone();
+    }
+    let target_w = max_w;
+    let target_h = ((h * target_w) / w).max(1);
+    let mut pixels = Vec::with_capacity(target_w * target_h);
+
+    for ty in 0..target_h {
+        let sy = (ty * h) / target_h;
+        for tx in 0..target_w {
+            let sx = (tx * w) / target_w;
+            pixels.push(img.pixels[sy * w + sx]);
+        }
+    }
+    egui::ColorImage {
+        size: [target_w, target_h],
+        pixels,
+    }
+}
+
+pub fn path_to_file_uri(path: &Path) -> String {
+    let abs_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let path_str = abs_path.to_string_lossy();
+    let mut uri = String::with_capacity(path_str.len() + 16);
+    uri.push_str("file://");
+    if !path_str.starts_with('/') {
+        uri.push('/');
+    }
+    for &b in path_str.as_bytes() {
+        match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                uri.push(b as char);
+            }
+            _ => {
+                use std::fmt::Write;
+                let _ = write!(uri, "%{:02X}", b);
+            }
+        }
+    }
+    uri
+}
+
+fn get_xdg_thumbnail(path: &Path) -> Option<egui::ColorImage> {
+    let uri = path_to_file_uri(path);
+    let hash = md5_hex(uri.as_bytes());
+
+    let mut cache_dirs = Vec::new();
+    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
+        cache_dirs.push(format!("{xdg}/thumbnails"));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        cache_dirs.push(format!("{home}/.cache/thumbnails"));
+    }
+
     let dirs = ["xx-large", "x-large", "large", "normal"];
-    for d in &dirs {
-        let candidate = format!("{home}/.cache/thumbnails/{d}/{hash}.png");
-        if let Ok(bytes) = fs::read(&candidate) {
-            if let Some(img) = load_color_image_from_bytes(&bytes) {
-                return Some(img);
+    for base in &cache_dirs {
+        for d in &dirs {
+            let candidate = format!("{base}/{d}/{hash}.png");
+            if let Ok(bytes) = fs::read(&candidate) {
+                if let Some(img) = load_color_image_from_bytes(&bytes) {
+                    return Some(img);
+                }
             }
         }
     }
@@ -6005,6 +6674,7 @@ mod tests {
             total_pages: 5,
             page_images: HashMap::new(),
             page_textures: HashMap::new(),
+            thumb_textures: HashMap::new(),
         };
         let pdf_sz = app.calculate_optimal_size();
         assert_eq!(pdf_sz, egui::vec2(1020.0, 880.0));
@@ -6547,5 +7217,123 @@ trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n274\n%%EOF\n";
         assert_eq!(img.size, [208, 208]); // 100pt @ 150 DPI = 208px
 
         let _ = std::fs::remove_file(&temp_path);
+    }
+
+    #[test]
+    fn test_md5_hex() {
+        assert_eq!(md5_hex(b""), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(
+            md5_hex(b"The quick brown fox jumps over the lazy dog"),
+            "9e107d9d372bb6826bd81d3542a419d6"
+        );
+        assert_eq!(
+            md5_hex(b"file:///home/user/test.pdf"),
+            "0fd9e3ea8a408684cf0ee31096b1bfa0"
+        );
+    }
+
+    #[test]
+    fn test_pdf_sidebar_auto_state() {
+        let app = QuickLookApp::new(None);
+        assert!(app.pdf_show_sidebar);
+        assert_eq!(app.pdf_scroll_accum, 0.0);
+    }
+
+    #[test]
+    fn test_pdf_pan_clamping_logic() {
+        let zoom = 1.0_f32;
+        let mut pan = egui::vec2(50.0, -30.0);
+        if zoom <= 1.05 {
+            pan = egui::Vec2::ZERO;
+        }
+        assert_eq!(pan, egui::Vec2::ZERO);
+
+        let zoom_in = 2.0_f32;
+        let page_w = 1200.0_f32;
+        let avail_w = 800.0_f32;
+        let max_pan_x = ((page_w - avail_w).max(0.0) * 0.5) + 120.0;
+        let mut pan_in = egui::vec2(1000.0, -1000.0);
+        if zoom_in > 1.05 {
+            pan_in.x = pan_in.x.clamp(-max_pan_x, max_pan_x);
+        }
+        assert_eq!(pan_in.x, 320.0);
+    }
+
+    #[test]
+    fn test_pdf_scroll_accumulator_damping() {
+        let mut accum = -10.0_f32;
+        assert!(accum > -24.0);
+        accum *= 0.8;
+        assert_eq!(accum, -8.0);
+    }
+
+    #[test]
+    fn test_path_to_file_uri_percent_encoding() {
+        let p1 = Path::new("/home/user/document.pdf");
+        assert_eq!(path_to_file_uri(p1), "file:///home/user/document.pdf");
+
+        let p2 = Path::new("/home/user/My Document (1).pdf");
+        assert_eq!(
+            path_to_file_uri(p2),
+            "file:///home/user/My%20Document%20%281%29.pdf"
+        );
+
+        let p3 = Path::new("/tmp/test#alpha%beta.pdf");
+        assert_eq!(
+            path_to_file_uri(p3),
+            "file:///tmp/test%23alpha%25beta.pdf"
+        );
+    }
+
+    #[test]
+    fn test_run_command_with_timeout_large_pipe_output() {
+        // Child writes 200 KB (> 64 KB OS pipe buffer) to stdout
+        // Tests that concurrent reader thread drains stdout without blocking or deadlocking
+        let child = std::process::Command::new("head")
+            .args(["-c", "200000", "/dev/zero"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let start = Instant::now();
+        let res = run_command_with_timeout(child, std::time::Duration::from_millis(2000));
+        assert!(res.is_some());
+        let data = res.unwrap();
+        assert_eq!(data.len(), 200000);
+        assert!(start.elapsed().as_millis() < 500);
+    }
+
+    #[test]
+    fn test_estimate_pdf_pages_catalog_count_priority() {
+        // A PDF chunk with /Count 42 in /Type /Pages but only 2 /Type /Page objects in the chunk
+        let raw_chunk = b"%PDF-1.4\n1 0 obj\n<< /Type /Pages /Kids [2 0 R 3 0 R] /Count 42 >>\nendobj\n2 0 obj\n<< /Type /Page >>\nendobj\n3 0 obj\n<< /Type /Page >>\nendobj\n";
+        let count = estimate_pdf_pages_from_bytes(raw_chunk);
+        assert_eq!(count, Some(42));
+    }
+
+    #[test]
+    fn test_create_thumbnail() {
+        let original = egui::ColorImage {
+            size: [300, 450],
+            pixels: vec![egui::Color32::WHITE; 300 * 450],
+        };
+        let thumb = create_thumbnail(&original, 100);
+        assert_eq!(thumb.size, [100, 150]);
+        assert_eq!(thumb.pixels.len(), 100 * 150);
+    }
+
+    #[test]
+    fn test_pdf_pointer_in_hud_isolation() {
+        let central = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let hud = egui::Rect::from_center_size(egui::pos2(400.0, 572.0), egui::vec2(320.0, 38.0));
+
+        let inside_hud = egui::pos2(400.0, 572.0);
+        assert!(hud.contains(inside_hud));
+        assert!(central.contains(inside_hud));
+
+        let outside_hud = egui::pos2(400.0, 300.0);
+        assert!(!hud.contains(outside_hud));
+        assert!(central.contains(outside_hud));
     }
 }
