@@ -731,6 +731,7 @@ impl eframe::App for QuickLookApp {
         // Keyboard Shortcuts (macOS Quick Look Behavior)
         ctx.input(|i| {
             let is_presentation = matches!(self.file_kind, FileKind::Presentation { .. });
+            let is_pdf = matches!(self.file_kind, FileKind::Pdf { .. });
 
             // 1. External editor / file open (Universal: O or Enter)
             if i.key_pressed(egui::Key::O) || i.key_pressed(egui::Key::Enter) {
@@ -812,6 +813,67 @@ impl eframe::App for QuickLookApp {
                         }
                     }
                 }
+            } else if is_pdf {
+                // --- PDF MODE KEYBOARD ROUTING ---
+                if i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Q) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+
+                let alt = i.modifiers.alt;
+                let shift = i.modifiers.shift;
+
+                if alt {
+                    if i.key_pressed(egui::Key::ArrowLeft)
+                        || i.key_pressed(egui::Key::ArrowUp)
+                        || i.key_pressed(egui::Key::OpenBracket)
+                    {
+                        self.navigate(-1);
+                    }
+                    if i.key_pressed(egui::Key::ArrowRight)
+                        || i.key_pressed(egui::Key::ArrowDown)
+                        || i.key_pressed(egui::Key::CloseBracket)
+                    {
+                        self.navigate(1);
+                    }
+                } else {
+                    let next_page = i.key_pressed(egui::Key::ArrowRight)
+                        || i.key_pressed(egui::Key::ArrowDown)
+                        || i.key_pressed(egui::Key::PageDown)
+                        || i.key_pressed(egui::Key::J)
+                        || (i.key_pressed(egui::Key::Space) && !shift);
+
+                    let prev_page = i.key_pressed(egui::Key::ArrowLeft)
+                        || i.key_pressed(egui::Key::ArrowUp)
+                        || i.key_pressed(egui::Key::PageUp)
+                        || i.key_pressed(egui::Key::K)
+                        || i.key_pressed(egui::Key::Backspace)
+                        || (i.key_pressed(egui::Key::Space) && shift);
+
+                    let first_page = i.key_pressed(egui::Key::Home);
+                    let last_page = i.key_pressed(egui::Key::End);
+
+                    if let FileKind::Pdf { current_page, total_pages, .. } = &mut self.file_kind {
+                        let total = *total_pages;
+                        let mut target_page = None;
+                        if next_page && *current_page < total {
+                            target_page = Some(*current_page + 1);
+                        } else if prev_page && *current_page > 1 {
+                            target_page = Some(*current_page - 1);
+                        } else if first_page {
+                            target_page = Some(1);
+                        } else if last_page {
+                            target_page = Some(total);
+                        }
+
+                        if let Some(tp) = target_page {
+                            *current_page = tp;
+                            self.pdf_scroll_target = Some(tp);
+                            if let Some(p) = self.current_path.as_deref() {
+                                self.pdf_loader.request_page(p, tp);
+                            }
+                        }
+                    }
+                }
             } else {
                 // --- STANDARD PREVIEW MODE ---
                 if i.key_pressed(egui::Key::Escape)
@@ -834,35 +896,6 @@ impl eframe::App for QuickLookApp {
                     || i.key_pressed(egui::Key::CloseBracket)
                 {
                     self.navigate(1);
-                }
-
-                if i.key_pressed(egui::Key::PageDown) {
-                    if let FileKind::Pdf { current_page, total_pages, .. } = &mut self.file_kind {
-                        if *current_page < *total_pages {
-                            *current_page += 1;
-                            self.pdf_scroll_target = Some(*current_page);
-                        }
-                    }
-                }
-                if i.key_pressed(egui::Key::PageUp) {
-                    if let FileKind::Pdf { current_page, .. } = &mut self.file_kind {
-                        if *current_page > 1 {
-                            *current_page -= 1;
-                            self.pdf_scroll_target = Some(*current_page);
-                        }
-                    }
-                }
-                if i.key_pressed(egui::Key::Home) {
-                    if let FileKind::Pdf { current_page, .. } = &mut self.file_kind {
-                        *current_page = 1;
-                        self.pdf_scroll_target = Some(1);
-                    }
-                }
-                if i.key_pressed(egui::Key::End) {
-                    if let FileKind::Pdf { current_page, total_pages, .. } = &mut self.file_kind {
-                        *current_page = *total_pages;
-                        self.pdf_scroll_target = Some(*total_pages);
-                    }
                 }
             }
         });
@@ -999,12 +1032,7 @@ impl eframe::App for QuickLookApp {
                         // Audio Volume Control in Top Bar (matching Screenshot 2)
                         if matches!(self.file_kind, FileKind::Media { kind: "Audio", .. }) {
                             if let Some(player) = &mut self.media_player {
-                                let vol_icon = if player.volume <= 0.01 { "🔇" } else { "🔊" };
-                                ui.label(vol_icon);
-                                ui.add_sized(
-                                    [68.0, 16.0],
-                                    egui::Slider::new(&mut player.volume, 0.0..=1.0).show_value(false),
-                                );
+                                custom_volume_control(ui, &mut player.volume);
                                 ui.separator();
                             }
                         }
@@ -1079,8 +1107,8 @@ impl eframe::App for QuickLookApp {
                             page_textures.insert(resp.page, handle);
                             ctx.request_repaint();
 
-                            // Enforce distance-based LRU eviction: MAX_CACHED_PAGES = 32
-                            const MAX_CACHED_PAGES: usize = 32;
+                            // Enforce distance-based LRU eviction: MAX_CACHED_PAGES = 6 (keeps RAM footprint minimal)
+                            const MAX_CACHED_PAGES: usize = 6;
                             while page_textures.len() > MAX_CACHED_PAGES {
                                 let cur = *current_page;
                                 if let Some((&furthest_page, _)) = page_textures
@@ -2389,6 +2417,159 @@ fn render_archive_viewer(
         });
 }
 
+fn custom_control_button(
+    ui: &mut egui::Ui,
+    icon: &str,
+    size: f32,
+    font_size: f32,
+    tooltip: &str,
+) -> egui::Response {
+    let desired_size = egui::vec2(size, size);
+    let (rect, resp) = ui.allocate_exact_size(desired_size, egui::Sense::click());
+    let painter = ui.painter_at(rect);
+
+    let bg_color = if resp.is_pointer_button_down_on() {
+        egui::Color32::from_white_alpha(55)
+    } else if resp.hovered() {
+        egui::Color32::from_white_alpha(28)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+
+    if bg_color != egui::Color32::TRANSPARENT {
+        painter.circle_filled(rect.center(), size / 2.0, bg_color);
+    }
+
+    let text_color = if resp.hovered() {
+        egui::Color32::WHITE
+    } else {
+        egui::Color32::from_rgb(220, 220, 225)
+    };
+
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        icon,
+        egui::FontId::proportional(font_size),
+        text_color,
+    );
+
+    if !tooltip.is_empty() {
+        resp.on_hover_text(tooltip)
+    } else {
+        resp
+    }
+}
+
+fn custom_media_scrubber(
+    ui: &mut egui::Ui,
+    current_time: &mut f64,
+    duration: f64,
+    width: f32,
+) -> Option<f64> {
+    let dur = duration.max(0.1);
+    let desired_size = egui::vec2(width.max(60.0), 22.0);
+    let (rect, resp) = ui.allocate_exact_size(desired_size, egui::Sense::click_and_drag());
+
+    let is_active = resp.hovered() || resp.dragged();
+    let track_h = if is_active { 5.5 } else { 3.5 };
+    let track_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(rect.width(), track_h));
+    let track_rounding = egui::Rounding::same(track_h / 2.0);
+
+    let progress = (*current_time / dur).clamp(0.0, 1.0) as f32;
+    let filled_w = track_rect.width() * progress;
+    let filled_rect = egui::Rect::from_min_size(
+        track_rect.min,
+        egui::vec2(filled_w, track_h),
+    );
+
+    let knob_center = egui::pos2(track_rect.min.x + filled_w, track_rect.center().y);
+    let knob_radius = if is_active { 7.0 } else { 5.0 };
+
+    let painter = ui.painter_at(rect);
+
+    // Track background
+    painter.rect_filled(track_rect, track_rounding, egui::Color32::from_white_alpha(35));
+
+    // Filled progress
+    if filled_w > 0.0 {
+        painter.rect_filled(
+            filled_rect,
+            track_rounding,
+            egui::Color32::from_rgb(255, 255, 255), // Pure white progress like macOS Quick Look
+        );
+    }
+
+    // Knob drop shadow
+    painter.circle_filled(
+        knob_center + egui::vec2(0.0, 1.0),
+        knob_radius + 0.5,
+        egui::Color32::from_black_alpha(80),
+    );
+
+    // Knob body
+    painter.circle_filled(knob_center, knob_radius, egui::Color32::WHITE);
+
+    let mut seek_target = None;
+
+    if resp.dragged() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let frac = ((pos.x - track_rect.min.x) / track_rect.width()).clamp(0.0, 1.0);
+            *current_time = (frac as f64) * dur;
+        }
+    }
+
+    if resp.drag_stopped() {
+        seek_target = Some(*current_time);
+    } else if resp.clicked() && !resp.dragged() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let frac = ((pos.x - track_rect.min.x) / track_rect.width()).clamp(0.0, 1.0);
+            let target = (frac as f64) * dur;
+            *current_time = target;
+            seek_target = Some(target);
+        }
+    }
+
+    seek_target
+}
+
+fn custom_volume_control(ui: &mut egui::Ui, volume: &mut f32) {
+    let vol_icon = if *volume <= 0.01 { "🔇" } else { "🔊" };
+    let icon_resp = custom_control_button(ui, vol_icon, 24.0, 13.0, "Mute / Unmute");
+    if icon_resp.clicked() {
+        if *volume <= 0.01 {
+            *volume = 1.0;
+        } else {
+            *volume = 0.0;
+        }
+    }
+
+    let track_w = 54.0_f32;
+    let track_h = 3.5_f32;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(track_w, 20.0), egui::Sense::click_and_drag());
+    let track_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(track_w, track_h));
+    let track_rounding = egui::Rounding::same(track_h / 2.0);
+
+    let progress = volume.clamp(0.0, 1.0);
+    let filled_w = track_rect.width() * progress;
+    let filled_rect = egui::Rect::from_min_size(track_rect.min, egui::vec2(filled_w, track_h));
+    let knob_center = egui::pos2(track_rect.min.x + filled_w, track_rect.center().y);
+    let knob_radius = if resp.hovered() || resp.dragged() { 5.5 } else { 4.0 };
+
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(track_rect, track_rounding, egui::Color32::from_white_alpha(35));
+    if filled_w > 0.0 {
+        painter.rect_filled(filled_rect, track_rounding, egui::Color32::WHITE);
+    }
+    painter.circle_filled(knob_center, knob_radius, egui::Color32::WHITE);
+
+    if resp.dragged() || resp.clicked() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            *volume = ((pos.x - track_rect.min.x) / track_rect.width()).clamp(0.0, 1.0);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_pdf_viewer(
     ui: &mut egui::Ui,
@@ -2399,7 +2580,7 @@ fn render_pdf_viewer(
     pdf_loader: &mut PdfLoader,
     scroll_target: &mut Option<usize>,
     zoom_scale: &mut f32,
-    _pan_offset: &mut egui::Vec2,
+    pan_offset: &mut egui::Vec2,
 ) {
     let total_pages = total_pages.max(1);
     *current_page = (*current_page).clamp(1, total_pages);
@@ -2410,9 +2591,10 @@ fn render_pdf_viewer(
         *zoom_scale = (*zoom_scale * zoom_delta).clamp(0.2, 5.0);
     }
 
-    // Determine reference aspect ratio from page 1 or first loaded texture, fallback to ISO A4 (595.28 / 841.89)
+    // Reference aspect ratio (ISO A4 standard fallback: 595.28 / 841.89)
     let ref_aspect = page_textures
-        .get(&1)
+        .get(current_page)
+        .or_else(|| page_textures.get(&1))
         .or_else(|| page_textures.values().next())
         .map(|t| {
             let s = t.size_vec2();
@@ -2424,7 +2606,22 @@ fn render_pdf_viewer(
         })
         .unwrap_or(595.28 / 841.89);
 
-    // 1. Left sidebar — page thumbnails (macOS Quick Look standard)
+    // Request active page immediately if missing and not failed (Lazy Loading)
+    if !page_textures.contains_key(current_page) && !pdf_loader.failed.contains(current_page) {
+        pdf_loader.request_page(path, *current_page);
+    }
+    // Prefetch next page if available
+    let next_page = *current_page + 1;
+    if next_page <= total_pages
+        && !page_textures.contains_key(&next_page)
+        && !pdf_loader.failed.contains(&next_page)
+    {
+        pdf_loader.request_page(path, next_page);
+    }
+
+    let mut page_to_navigate = None;
+
+    // 1. Left sidebar — page thumbnails (instant vector cards, zero batch pdftoppm overhead)
     egui::SidePanel::left("pdf_thumbs")
         .exact_width(136.0)
         .resizable(false)
@@ -2438,10 +2635,10 @@ fn render_pdf_viewer(
                 .id_salt("pdf_thumb_scroll")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 10.0;
+                    ui.spacing_mut().item_spacing.y = 12.0;
 
-                    let thumb_w = 100.0_f32;
-                    let thumb_h = (thumb_w / ref_aspect).clamp(65.0, 150.0);
+                    let thumb_w = 98.0_f32;
+                    let thumb_h = (thumb_w / ref_aspect).clamp(65.0, 145.0);
                     let card_size = egui::vec2(thumb_w, thumb_h);
 
                     for page in 1..=total_pages {
@@ -2452,17 +2649,12 @@ fn render_pdf_viewer(
                                 ui.allocate_exact_size(card_size, egui::Sense::click());
 
                             if response.clicked() {
-                                *current_page = page;
-                                *scroll_target = Some(page);
+                                page_to_navigate = Some(page);
                             }
 
-                            // Request texture for thumbnail if missing and nearby / small doc
-                            if !page_textures.contains_key(&page)
-                                && !pdf_loader.failed.contains(&page)
-                                && (total_pages <= 32
-                                    || (page as isize - *current_page as isize).abs() <= 3)
-                            {
-                                pdf_loader.request_page(path, page);
+                            // Programmatic scroll into view when page changes
+                            if *scroll_target == Some(page) {
+                                response.scroll_to_me(Some(egui::Align::Center));
                             }
 
                             let painter = ui.painter_at(rect);
@@ -2471,9 +2663,16 @@ fn render_pdf_viewer(
                             } else if response.hovered() {
                                 egui::Color32::from_rgb(120, 120, 125)
                             } else {
-                                egui::Color32::from_rgb(55, 55, 60)
+                                egui::Color32::from_rgb(50, 50, 55)
                             };
                             let border_w = if is_selected { 2.5_f32 } else { 1.0_f32 };
+
+                            // Subtle drop shadow behind thumbnail card
+                            painter.rect_filled(
+                                rect.translate(egui::vec2(0.0, 2.0)),
+                                egui::Rounding::same(4.0),
+                                egui::Color32::from_black_alpha(40),
+                            );
 
                             // Pure white paper card base
                             painter.rect_filled(
@@ -2482,24 +2681,64 @@ fn render_pdf_viewer(
                                 egui::Color32::WHITE,
                             );
 
-                            // Real page texture or clean numbered placeholder
+                            // Real page texture IF already in memory, otherwise high-craft instant vector card
                             if let Some(tex) = page_textures.get(&page) {
                                 let img = egui::Image::new(tex)
                                     .fit_to_exact_size(card_size)
                                     .rounding(egui::Rounding::same(2.0));
                                 img.paint_at(ui, rect);
                             } else {
-                                let text_color = if pdf_loader.failed.contains(&page) {
-                                    egui::Color32::from_rgb(220, 80, 80)
-                                } else {
-                                    egui::Color32::from_rgb(170, 170, 180)
-                                };
+                                // Draw simulated document lines (0ms latency, zero subprocesses)
+                                let line_color = egui::Color32::from_rgb(225, 225, 232);
+                                let start_x = rect.min.x + 12.0;
+                                let end_x = rect.max.x - 12.0;
+                                let line_w = end_x - start_x;
+
+                                let y1 = rect.min.y + card_size.y * 0.28;
+                                let y2 = rect.min.y + card_size.y * 0.42;
+                                let y3 = rect.min.y + card_size.y * 0.56;
+                                let y4 = rect.min.y + card_size.y * 0.70;
+
+                                painter.rect_filled(
+                                    egui::Rect::from_min_size(
+                                        egui::pos2(start_x, y1),
+                                        egui::vec2(line_w * 0.65, 3.0),
+                                    ),
+                                    egui::Rounding::same(1.5),
+                                    line_color,
+                                );
+                                painter.rect_filled(
+                                    egui::Rect::from_min_size(
+                                        egui::pos2(start_x, y2),
+                                        egui::vec2(line_w, 2.0),
+                                    ),
+                                    egui::Rounding::same(1.0),
+                                    line_color,
+                                );
+                                painter.rect_filled(
+                                    egui::Rect::from_min_size(
+                                        egui::pos2(start_x, y3),
+                                        egui::vec2(line_w * 0.85, 2.0),
+                                    ),
+                                    egui::Rounding::same(1.0),
+                                    line_color,
+                                );
+                                painter.rect_filled(
+                                    egui::Rect::from_min_size(
+                                        egui::pos2(start_x, y4),
+                                        egui::vec2(line_w * 0.45, 2.0),
+                                    ),
+                                    egui::Rounding::same(1.0),
+                                    line_color,
+                                );
+
+                                // Page number in center
                                 painter.text(
                                     rect.center(),
                                     egui::Align2::CENTER_CENTER,
                                     format!("{page}"),
-                                    egui::FontId::proportional(14.0),
-                                    text_color,
+                                    egui::FontId::proportional(13.0),
+                                    egui::Color32::from_rgb(140, 140, 150),
                                 );
                             }
 
@@ -2514,7 +2753,7 @@ fn render_pdf_viewer(
                             ui.add_space(2.0);
                             ui.label(
                                 egui::RichText::new(format!("{page}"))
-                                    .size(10.0)
+                                    .size(10.5)
                                     .color(if is_selected {
                                         egui::Color32::from_rgb(0, 122, 255)
                                     } else {
@@ -2527,162 +2766,186 @@ fn render_pdf_viewer(
                 });
         });
 
-    // 2. Central continuous multi-page PDF document view
+    if scroll_target.is_some() {
+        *scroll_target = None;
+    }
+
+    // 2. Central PDF active page document view
+    let central_rect = ui.available_rect_before_wrap();
     egui::CentralPanel::default()
         .frame(
             egui::Frame::none()
-                .fill(egui::Color32::from_rgb(32, 32, 35)) // macOS Quick Look dark canvas
+                .fill(egui::Color32::from_rgb(32, 32, 35))
                 .inner_margin(egui::Margin::same(0.0)),
         )
         .show_inside(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .id_salt("pdf_continuous_scroll")
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 20.0;
-                    ui.add_space(20.0); // Top margin
+            // Mouse wheel page navigation
+            let scroll_y = ui.input(|i| i.raw_scroll_delta.y);
+            if scroll_y < -15.0 && *current_page < total_pages {
+                page_to_navigate = Some(*current_page + 1);
+            } else if scroll_y > 15.0 && *current_page > 1 {
+                page_to_navigate = Some(*current_page - 1);
+            }
 
-                    // Compute aspect-ratio-preserving page dimensions
-                    let avail_w = ui.available_width();
-                    let avail_h = ui.available_height();
-                    let usable_w = (avail_w - 64.0).max(200.0);
-                    let usable_h = (avail_h - 64.0).max(200.0);
+            let avail_w = (ui.available_width() - 48.0).max(180.0);
+            let avail_h = (ui.available_height() - 64.0).max(180.0);
 
-                    // At zoom 1.0, fit height cleanly or fit width, bounded nicely
-                    let fit_h_w = usable_h * ref_aspect;
-                    let base_w = usable_w.min(fit_h_w).clamp(240.0, 900.0);
+            // Calculate page dimensions with 100% mathematical aspect ratio preservation
+            let active_aspect = if let Some(tex) = page_textures.get(current_page) {
+                let s = tex.size_vec2();
+                if s.y > 0.0 {
+                    s.x / s.y
+                } else {
+                    ref_aspect
+                }
+            } else {
+                ref_aspect
+            };
 
-                    let viewport_rect = ui.clip_rect();
-                    let reading_line_y = viewport_rect.min.y + 80.0;
-                    let mut detected_page = None;
-                    let mut page_1_min_y = 0.0_f32;
+            let mut page_w = avail_w;
+            let mut page_h = page_w / active_aspect;
+            if page_h > avail_h {
+                page_h = avail_h;
+                page_w = page_h * active_aspect;
+            }
 
-                    ui.vertical_centered(|ui| {
-                        for page in 1..=total_pages {
-                            let page_aspect = page_textures
-                                .get(&page)
-                                .map(|t| {
-                                    let s = t.size_vec2();
-                                    if s.y > 0.0 {
-                                        s.x / s.y
-                                    } else {
-                                        ref_aspect
-                                    }
-                                })
-                                .unwrap_or(ref_aspect);
+            page_w = (page_w * (*zoom_scale)).max(160.0);
+            page_h = page_w / active_aspect;
+            let page_size = egui::vec2(page_w, page_h);
 
-                            let page_w = (base_w * (*zoom_scale)).max(160.0);
-                            let page_h = page_w / page_aspect;
-                            let page_size = egui::vec2(page_w, page_h);
+            ui.vertical_centered(|ui| {
+                let pad_y = ((ui.available_height() - 48.0 - page_h) * 0.5).max(16.0);
+                ui.add_space(pad_y);
 
-                            let (rect, resp) =
-                                ui.allocate_exact_size(page_size, egui::Sense::hover());
+                let (rect, resp) = ui.allocate_exact_size(page_size, egui::Sense::click_and_drag());
+                if resp.dragged() {
+                    *pan_offset += resp.drag_delta();
+                }
 
-                            if page == 1 {
-                                page_1_min_y = rect.min.y;
-                            }
+                let painter = ui.painter_at(rect);
 
-                            // Detect visible page crossing the top reading line.
-                            // For the final page, when scrolled to the bottom of a multi-page document,
-                            // page_h < viewport_h - 80px prevents rect.min.y from reaching reading_line_y;
-                            // clamp detected_page to total_pages when scrolled to the bottom.
-                            if (rect.min.y <= reading_line_y && rect.max.y > reading_line_y)
-                                || (page == total_pages
-                                    && rect.max.y <= viewport_rect.max.y + 30.0
-                                    && (total_pages == 1 || page_1_min_y < viewport_rect.min.y))
-                            {
-                                detected_page = Some(page);
-                            }
+                // macOS Quick Look drop shadow
+                painter.rect_filled(
+                    rect.translate(egui::vec2(0.0, 6.0)),
+                    egui::Rounding::same(6.0),
+                    egui::Color32::from_black_alpha(65),
+                );
 
-                            // Programmatic scroll-to-page target
-                            if *scroll_target == Some(page) {
-                                resp.scroll_to_me(Some(egui::Align::TOP));
-                            }
+                // White paper canvas
+                painter.rect_filled(
+                    rect,
+                    egui::Rounding::same(3.0),
+                    egui::Color32::WHITE,
+                );
 
-                            // Request page rasterization if missing and in or near viewport
-                            let prefetch_margin = (page_h * 1.5).clamp(120.0, 450.0);
-                            if !page_textures.contains_key(&page)
-                                && !pdf_loader.failed.contains(&page)
-                                && (total_pages <= 32
-                                    || rect.intersects(viewport_rect.expand(prefetch_margin))
-                                    || (page as isize - *current_page as isize).abs() <= 2)
-                            {
-                                pdf_loader.request_page(path, page);
-                            }
+                // Page texture or crisp loading placeholder
+                if let Some(tex) = page_textures.get(current_page) {
+                    let img = egui::Image::new(tex)
+                        .fit_to_exact_size(page_size)
+                        .rounding(egui::Rounding::same(3.0));
+                    img.paint_at(ui, rect);
+                } else {
+                    let is_failed = pdf_loader.failed.contains(current_page);
+                    painter.text(
+                        rect.center() - egui::vec2(0.0, 16.0),
+                        egui::Align2::CENTER_CENTER,
+                        if is_failed { "⚠️" } else { "📄" },
+                        egui::FontId::proportional(42.0),
+                        if is_failed {
+                            egui::Color32::from_rgb(220, 120, 100)
+                        } else {
+                            egui::Color32::from_rgb(180, 180, 190)
+                        },
+                    );
+                    painter.text(
+                        rect.center() + egui::vec2(0.0, 24.0),
+                        egui::Align2::CENTER_CENTER,
+                        if is_failed {
+                            format!("Page {} (Render Failed)", *current_page)
+                        } else {
+                            format!("Loading Page {} of {}...", *current_page, total_pages)
+                        },
+                        egui::FontId::proportional(14.0),
+                        if is_failed {
+                            egui::Color32::from_rgb(180, 90, 80)
+                        } else {
+                            egui::Color32::from_rgb(120, 120, 130)
+                        },
+                    );
+                }
 
-                            let painter = ui.painter_at(rect);
+                // Crisp boundary stroke
+                painter.rect_stroke(
+                    rect,
+                    egui::Rounding::same(3.0),
+                    egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(215, 215, 220)),
+                );
+            });
 
-                            // Drop shadow (macOS floating paper effect)
-                            let shadow_rect = rect.translate(egui::vec2(0.0, 4.0));
-                            painter.rect_filled(
-                                shadow_rect,
-                                egui::Rounding::same(6.0),
-                                egui::Color32::from_black_alpha(45),
+            // 3. Floating Page Navigation HUD at bottom center (macOS Quick Look pill)
+            let hud_rect = egui::Rect::from_center_size(
+                egui::pos2(central_rect.center().x, central_rect.bottom() - 32.0),
+                egui::vec2(190.0, 36.0),
+            );
+
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(hud_rect), |ui| {
+                egui::Frame::none()
+                    .fill(egui::Color32::from_black_alpha(205))
+                    .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(35)))
+                    .rounding(egui::Rounding::same(18.0))
+                    .shadow(egui::epaint::Shadow {
+                        offset: egui::vec2(0.0, 4.0),
+                        blur: 16.0,
+                        spread: 0.0,
+                        color: egui::Color32::from_black_alpha(90),
+                    })
+                    .inner_margin(egui::Margin::symmetric(10.0, 4.0))
+                    .show(ui, |ui| {
+                        ui.horizontal_centered(|ui| {
+                            let can_prev = *current_page > 1;
+                            let prev_resp = custom_control_button(
+                                ui,
+                                "◀",
+                                26.0,
+                                12.0,
+                                if can_prev { "Previous Page (Left / Up)" } else { "" },
                             );
-
-                            // White page canvas
-                            painter.rect_filled(
-                                rect,
-                                egui::Rounding::same(3.0),
-                                egui::Color32::WHITE,
-                            );
-
-                            // Page texture or loading placeholder
-                            if let Some(tex) = page_textures.get(&page) {
-                                let img = egui::Image::new(tex)
-                                    .fit_to_exact_size(page_size)
-                                    .rounding(egui::Rounding::same(3.0));
-                                img.paint_at(ui, rect);
-                            } else {
-                                let is_failed = pdf_loader.failed.contains(&page);
-                                painter.text(
-                                    rect.center() - egui::vec2(0.0, 16.0),
-                                    egui::Align2::CENTER_CENTER,
-                                    if is_failed { "⚠️" } else { "📄" },
-                                    egui::FontId::proportional(40.0),
-                                    if is_failed {
-                                        egui::Color32::from_rgb(220, 120, 100)
-                                    } else {
-                                        egui::Color32::from_rgb(180, 180, 190)
-                                    },
-                                );
-                                painter.text(
-                                    rect.center() + egui::vec2(0.0, 24.0),
-                                    egui::Align2::CENTER_CENTER,
-                                    if is_failed {
-                                        format!("Page {page} (Render Failed)")
-                                    } else {
-                                        format!("Page {page} of {total_pages}")
-                                    },
-                                    egui::FontId::proportional(14.0),
-                                    if is_failed {
-                                        egui::Color32::from_rgb(180, 90, 80)
-                                    } else {
-                                        egui::Color32::from_rgb(120, 120, 130)
-                                    },
-                                );
+                            if can_prev && prev_resp.clicked() {
+                                page_to_navigate = Some(*current_page - 1);
                             }
 
-                            // Crisp 1px boundary border
-                            painter.rect_stroke(
-                                rect,
-                                egui::Rounding::same(3.0),
-                                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(215, 215, 220)),
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new(format!("{} / {}", *current_page, total_pages))
+                                    .size(12.5)
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
                             );
-                        }
+                            ui.add_space(4.0);
+
+                            let can_next = *current_page < total_pages;
+                            let next_resp = custom_control_button(
+                                ui,
+                                "▶",
+                                26.0,
+                                12.0,
+                                if can_next { "Next Page (Right / Down / Space)" } else { "" },
+                            );
+                            if can_next && next_resp.clicked() {
+                                page_to_navigate = Some(*current_page + 1);
+                            }
+                        });
                     });
-
-                    // Clear programmatic scroll target once applied
-                    if scroll_target.is_some() {
-                        *scroll_target = None;
-                    } else if let Some(p) = detected_page {
-                        // Update current_page based on user scroll position
-                        *current_page = p;
-                    }
-
-                    ui.add_space(40.0); // Bottom margin
-                });
+            });
         });
+
+    if let Some(target_p) = page_to_navigate {
+        *current_page = target_p.clamp(1, total_pages);
+        *scroll_target = Some(*current_page);
+        if !page_textures.contains_key(current_page) {
+            pdf_loader.request_page(path, *current_page);
+        }
+    }
 }
 
 pub struct MediaPlayer {
@@ -2855,53 +3118,57 @@ fn render_audio_player(
     };
 
     // 1. Central card area — fills all space above the transport bar
-    let transport_h = 52.0_f32;
+    let transport_h = 56.0_f32;
     let body_h = (ui.available_height() - transport_h - 4.0).max(100.0);
 
     ui.allocate_ui_with_layout(
         egui::vec2(ui.available_width(), body_h),
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
-            ui.add_space(36.0);
+            ui.add_space(32.0);
 
-            // Album art — use allocate_painter so we get rect+painter in the right context
-            let art_size = egui::vec2(160.0, 160.0);
+            // Album art card (150x150, rounded corners)
+            let art_size = egui::vec2(150.0, 150.0);
             let (art_resp, art_painter) = ui.allocate_painter(art_size, egui::Sense::hover());
             let art_rect = art_resp.rect;
 
+            // Subtle drop shadow behind art card
+            art_painter.rect_filled(
+                art_rect.translate(egui::vec2(0.0, 4.0)),
+                egui::Rounding::same(14.0),
+                egui::Color32::from_black_alpha(60),
+            );
+
             if let Some(tex) = texture {
-                // Draw rounded album art directly via painter
                 art_painter.image(
                     tex.id(),
                     art_rect,
                     egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                     egui::Color32::WHITE,
                 );
-                // Rounded clip overlay (paint transparent round-rect over corners)
-                // Just draw a rounded border on top
                 art_painter.rect_stroke(
                     art_rect,
-                    egui::Rounding::same(12.0),
-                    egui::Stroke::new(2.0_f32, egui::Color32::from_black_alpha(30)),
+                    egui::Rounding::same(14.0),
+                    egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(30)),
                 );
             } else {
-                // Placeholder tile
+                // macOS Quick Look clean white card with subtle music note
                 art_painter.rect_filled(
                     art_rect,
-                    egui::Rounding::same(12.0),
-                    egui::Color32::from_rgb(236, 236, 240),
+                    egui::Rounding::same(14.0),
+                    egui::Color32::WHITE,
                 );
                 art_painter.rect_stroke(
                     art_rect,
-                    egui::Rounding::same(12.0),
-                    egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(210, 210, 218)),
+                    egui::Rounding::same(14.0),
+                    egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(220, 220, 228)),
                 );
                 art_painter.text(
                     art_rect.center(),
                     egui::Align2::CENTER_CENTER,
                     "♪",
                     egui::FontId::proportional(72.0),
-                    egui::Color32::from_rgb(170, 170, 178),
+                    egui::Color32::from_rgb(175, 175, 185),
                 );
             }
 
@@ -2909,7 +3176,7 @@ fn render_audio_player(
 
             // Track metadata
             ui.vertical(|ui| {
-                ui.add_space(14.0);
+                ui.add_space(8.0);
 
                 ui.label(
                     egui::RichText::new(&display_title)
@@ -2955,40 +3222,28 @@ fn render_audio_player(
         },
     );
 
-    // 2. Transport bar
+    // 2. Transport bar (macOS Quick Look dark glass)
     egui::Frame::none()
-        .fill(egui::Color32::from_rgb(22, 22, 24))
+        .fill(egui::Color32::from_rgb(20, 20, 22))
         .stroke(egui::Stroke::new(
             1.0_f32,
             egui::Color32::from_rgb(38, 38, 44),
         ))
-        .inner_margin(egui::Margin::symmetric(14.0, 8.0))
+        .inner_margin(egui::Margin::symmetric(14.0, 10.0))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
 
-                if ui
-                    .button(egui::RichText::new("⟲15").size(13.0))
-                    .on_hover_text("Rewind 15 seconds")
-                    .clicked()
-                {
+                if custom_control_button(ui, "⟲15", 30.0, 12.0, "Rewind 15 seconds").clicked() {
                     seek_to = Some((player.current_time - 15.0).max(0.0));
                 }
 
                 let play_icon = if player.is_playing { "⏸" } else { "▶" };
-                if ui
-                    .button(egui::RichText::new(play_icon).size(16.0).strong())
-                    .on_hover_text("Play / Pause (P)")
-                    .clicked()
-                {
+                if custom_control_button(ui, play_icon, 34.0, 16.0, "Play / Pause (P)").clicked() {
                     toggle_play = true;
                 }
 
-                if ui
-                    .button(egui::RichText::new("15⟳").size(13.0))
-                    .on_hover_text("Forward 15 seconds")
-                    .clicked()
-                {
+                if custom_control_button(ui, "15⟳", 30.0, 12.0, "Forward 15 seconds").clicked() {
                     seek_to = Some((player.current_time + 15.0).min(player.duration));
                 }
 
@@ -2996,20 +3251,12 @@ fn render_audio_player(
                     egui::RichText::new(format_time(player.current_time))
                         .monospace()
                         .size(12.0)
-                        .color(egui::Color32::from_rgb(190, 190, 195)),
+                        .color(egui::Color32::from_rgb(200, 200, 205)),
                 );
 
-                let mut slider_val = player.current_time;
-                let slider_width = (ui.available_width() - 90.0).max(60.0);
-                let slider_resp = ui.add_sized(
-                    [slider_width, 18.0],
-                    egui::Slider::new(&mut slider_val, 0.0..=player.duration.max(1.0))
-                        .show_value(false),
-                );
-                if slider_resp.drag_stopped() || (slider_resp.clicked() && !slider_resp.dragged()) {
-                    seek_to = Some(slider_val);
-                } else if slider_resp.dragged() {
-                    player.current_time = slider_val;
+                let scrubber_w = (ui.available_width() - 95.0).max(80.0);
+                if let Some(target) = custom_media_scrubber(ui, &mut player.current_time, player.duration, scrubber_w) {
+                    seek_to = Some(target);
                 }
 
                 ui.label(
@@ -3019,11 +3266,7 @@ fn render_audio_player(
                         .color(egui::Color32::from_rgb(140, 140, 145)),
                 );
 
-                if ui
-                    .button(egui::RichText::new(">>").size(13.0))
-                    .on_hover_text("Next file")
-                    .clicked()
-                {
+                if custom_control_button(ui, "⏭", 30.0, 13.0, "Next file").clicked() {
                     nav_delta = Some(1_isize);
                 }
             });
@@ -3055,9 +3298,8 @@ fn render_media_player(
     let mut seek_to = None;
     let mut toggle_play = false;
 
-    let video_area_height = (available_rect.height() - 70.0).max(100.0);
     let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(available_rect.width(), video_area_height),
+        available_rect.size(),
         egui::Sense::click_and_drag(),
     );
 
@@ -3122,93 +3364,71 @@ fn render_media_player(
     }
 
     // Floating macOS Glass HUD at Bottom
-    egui::Frame::canvas(ui.style())
-        .fill(egui::Color32::from_black_alpha(190))
-        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(35)))
-        .rounding(egui::Rounding::same(20.0))
-        .shadow(egui::epaint::Shadow {
-            offset: egui::vec2(0.0, 4.0),
-            blur: 16.0,
-            spread: 0.0,
-            color: egui::Color32::from_black_alpha(80),
-        })
-        .inner_margin(egui::Margin::symmetric(16.0, 8.0))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                // Rewind 15
-                if ui.button(egui::RichText::new("⟲15").size(13.0)).clicked() {
-                    seek_to = Some((player.current_time - 15.0).max(0.0));
-                }
+    let hud_w = (rect.width() - 48.0).clamp(420.0, 680.0);
+    let hud_h = 44.0_f32;
+    let hud_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.center().x, rect.bottom() - 34.0),
+        egui::vec2(hud_w, hud_h),
+    );
 
-                // Play / Pause Button
-                let play_icon = if player.is_playing { "⏸" } else { "▶" };
-                if ui
-                    .button(egui::RichText::new(play_icon).size(16.0).strong())
-                    .on_hover_text("Play / Pause (Click or press P)")
-                    .clicked()
-                {
-                    toggle_play = true;
-                }
+    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(hud_rect), |ui| {
+        egui::Frame::none()
+            .fill(egui::Color32::from_black_alpha(205))
+            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(35)))
+            .rounding(egui::Rounding::same(22.0))
+            .shadow(egui::epaint::Shadow {
+                offset: egui::vec2(0.0, 4.0),
+                blur: 16.0,
+                spread: 0.0,
+                color: egui::Color32::from_black_alpha(90),
+            })
+            .inner_margin(egui::Margin::symmetric(14.0, 6.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
 
-                // Forward 15
-                if ui.button(egui::RichText::new("15⟳").size(13.0)).clicked() {
-                    seek_to = Some((player.current_time + 15.0).min(player.duration));
-                }
+                    if custom_control_button(ui, "⟲15", 28.0, 12.0, "Rewind 15 seconds").clicked() {
+                        seek_to = Some((player.current_time - 15.0).max(0.0));
+                    }
 
-                // Time Elapsed
-                ui.label(
-                    egui::RichText::new(format_time(player.current_time))
-                        .monospace()
-                        .size(12.0)
-                        .color(egui::Color32::from_rgb(200, 200, 210)),
-                );
+                    let play_icon = if player.is_playing { "⏸" } else { "▶" };
+                    if custom_control_button(ui, play_icon, 32.0, 15.0, "Play / Pause (P)").clicked() {
+                        toggle_play = true;
+                    }
 
-                // Scrubber Slider
-                let mut slider_val = player.current_time;
-                let slider_width = calculate_scrubber_width(ui.available_width());
-                let slider_resp = ui.add_sized(
-                    [slider_width, 18.0],
-                    egui::Slider::new(&mut slider_val, 0.0..=player.duration.max(1.0))
-                        .show_value(false),
-                );
+                    if custom_control_button(ui, "15⟳", 28.0, 12.0, "Forward 15 seconds").clicked() {
+                        seek_to = Some((player.current_time + 15.0).min(player.duration));
+                    }
 
-                if slider_resp.drag_stopped() || (slider_resp.clicked() && !slider_resp.dragged()) {
-                    seek_to = Some(slider_val);
-                } else if slider_resp.dragged() {
-                    player.current_time = slider_val;
-                }
+                    ui.label(
+                        egui::RichText::new(format_time(player.current_time))
+                            .monospace()
+                            .size(11.5)
+                            .color(egui::Color32::from_rgb(200, 200, 210)),
+                    );
 
-                // Time Total
-                ui.label(
-                    egui::RichText::new(format_time(player.duration))
-                        .monospace()
-                        .size(12.0)
-                        .color(egui::Color32::from_rgb(140, 140, 150)),
-                );
+                    let scrubber_w = calculate_scrubber_width(ui.available_width());
+                    if let Some(target) = custom_media_scrubber(ui, &mut player.current_time, player.duration, scrubber_w) {
+                        seek_to = Some(target);
+                    }
 
-                ui.separator();
+                    ui.label(
+                        egui::RichText::new(format_time(player.duration))
+                            .monospace()
+                            .size(11.5)
+                            .color(egui::Color32::from_rgb(140, 140, 150)),
+                    );
 
-                // Volume Icon + Slider
-                let vol_icon = if player.volume <= 0.01 { "🔇" } else { "🔊" };
-                ui.label(vol_icon);
-                ui.add_sized(
-                    [55.0, 18.0],
-                    egui::Slider::new(&mut player.volume, 0.0..=1.0).show_value(false),
-                );
+                    ui.separator();
 
-                // Open with App
-                if ui
-                    .button(
-                        egui::RichText::new("↗")
-                            .color(egui::Color32::from_rgb(200, 200, 255)),
-                    )
-                    .on_hover_text("Open in default system player")
-                    .clicked()
-                {
-                    let _ = open::that(&player.path);
-                }
+                    custom_volume_control(ui, &mut player.volume);
+
+                    if custom_control_button(ui, "↗", 26.0, 13.0, "Open in default system player").clicked() {
+                        let _ = open::that(&player.path);
+                    }
+                });
             });
-        });
+    });
 
     if toggle_play {
         player.toggle_playback();
@@ -5251,6 +5471,20 @@ mod tests {
         assert_eq!(calculate_scrubber_width(100.0), 60.0);
         assert_eq!(calculate_scrubber_width(0.0), 60.0);
         assert_eq!(calculate_scrubber_width(-50.0), 60.0);
+    }
+
+    #[test]
+    fn test_media_scrubber_calculation() {
+        let duration = 120.0;
+        let frac = 0.5;
+        let time = frac * duration;
+        assert_eq!(time, 60.0);
+
+        let clamped_frac = (-0.2_f64).clamp(0.0, 1.0);
+        assert_eq!(clamped_frac * duration, 0.0);
+
+        let over_frac = (1.5_f64).clamp(0.0, 1.0);
+        assert_eq!(over_frac * duration, 120.0);
     }
 
     #[test]
